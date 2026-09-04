@@ -1,0 +1,11 @@
+[
+  {
+    "Name": "New Profile",
+    "Projects": [
+      {
+        "Path": "Msft2009TestApp\\TestApp.csproj",
+        "Action": "Start"
+      }
+    ]
+  }
+]
