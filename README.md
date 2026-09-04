@@ -1,7 +1,6 @@
 # MSFT 2009 Format + Offline IID Research Library
 Include Source + Test Results
 
-Markdown
 ## Legal Notice & Disclaimer
 
 This software and documentation are provided strictly for educational, research, and interoperability analysis purposes. 
