@@ -1,6 +1,14 @@
 # MSFT 2009 Format + Offline IID Research Library
 Include Source + Test Results
 
+## SecurityID Recover
+````
+SecurityID cannot be fully recovered (Lossy / Truncated).
+Parts are checked as boolean flags (e.g., BYTE11 checks if != 0), 
+and the rest is bit-masked and chopped down into a smaller internal 32-bit field.
+BYTE11(v53) = (*(_DWORD *)(a1 + 28) != 0 ? 8 : 0) | ...
+````
+
 ## How to use
 ````
 Group - 11
