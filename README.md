@@ -2,12 +2,10 @@
 Include Source + Test Results
 
 ## Legal Notice & Disclaimer
-
-This software and documentation are provided strictly for educational, research, and interoperability analysis purposes. 
-
-- **Non-Affiliation:** This project is an independent research initiative and is not affiliated with, endorsed by, or sponsored by Microsoft Corporation. All product names, trademarks, and registered trademarks are property of their respective owners and are used solely for identification purposes.
-- **No Warranty:** The software is provided "as is", without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability arising from, out of, or in connection with the software or the use or other dealings in the software.
-- **User Responsibility:** Users are solely responsible for ensuring that their utilization of this repository complies with all applicable local, national, and international laws, regulations, and terms of service.
+This project documents independent research and analysis of proprietary Microsoft formats for educational and interoperability purposes only. 
+- All trademarks and proprietary formats belong to Microsoft Corporation. 
+- This material is not intended to bypass security controls or facilitate unauthorized activation. 
+- Users are solely responsible for ensuring compliance with applicable laws.
 
 ## Security Value
 ````
