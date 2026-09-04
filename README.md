@@ -2,10 +2,10 @@
 Include Source + Test Results
 
 ## Legal Notice & Disclaimer
-This project documents independent research and analysis of proprietary Microsoft formats for educational and interoperability purposes only. 
-- All trademarks and proprietary formats belong to Microsoft Corporation. 
-- This material is not intended to bypass security controls or facilitate unauthorized activation. 
-- Users are solely responsible for ensuring compliance with applicable laws.
+This project is an independent research initiative intended solely for educational, archival, and software interoperability analysis. 
+- **Proprietary Software & Trademarks:** All product names, trademarks, and proprietary binary formats referenced herein are the property of Microsoft Corporation. 
+- **No Authorization for Bypass:** This repository does not provide tools, keys, or mechanisms designed to bypass software activation controls, violate licensing terms, or infringe upon Microsoft intellectual property. 
+- **Limitation of Liability:** The author assumes no liability for any misuse of the information provided. Users are strictly required to ensure that their actions comply with all applicable local laws and Microsoft's terms of service.
 
 ## Security Value
 ````
