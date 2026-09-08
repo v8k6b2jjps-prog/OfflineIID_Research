@@ -1,68 +1,147 @@
 ﻿using System;
-using System.Security.Cryptography;
 using System.Text;
-
-namespace Msft2009
+using System.Threading;
+using System.Security.Cryptography;
+public struct DecodedParameters
 {
-    public static class MSFT
-    {
-
-        public static int GetInstallationIdString(
-                uint groupID,
-                uint serial,
-                ulong securityID,
-                long hwid,
-                out string formattedIid
-            )
-        {
-            formattedIid = string.Empty;
-            try
-            {
-                byte[] pkeyData = new byte[88];
-                Buffer.BlockCopy(BitConverter.GetBytes(groupID), 0, pkeyData, 16, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes(serial), 0, pkeyData, 24, 4);
-                Buffer.BlockCopy(BitConverter.GetBytes(securityID), 0, pkeyData, 32, 8);
-
-                byte[] cipherBlock;
-                long hr = InstallationIdManager.BuildAndEncryptCipherBlock(pkeyData, hwid, out cipherBlock);
-                if (hr != 0) return (int)hr;
-
-                string rawDecimal = IidHelper.BinaryToDecimalString(cipherBlock, 179);
-                formattedIid = IidHelper.FormatInstallationId(rawDecimal);
-                return 0;
-            }
-            catch
-            {
-                return -2;
-            }
-        }
-
-        public static int ReadParametersFromString(
-            string formattedIid,
-            out DecodedParameters outParams
+    public uint securityID;
+    public ushort groupID;
+    public uint serial;
+    public long hwid;
+}
+public class MSFT
+{
+    private static readonly object _lockObj = new object();
+    public static int GetInstallationIdString(
+            uint groupID,
+            uint serial,
+            ulong securityID,
+            long hwid,
+            out string formattedIid
         )
+    {
+        formattedIid = string.Empty;
+        try
         {
-            outParams = new DecodedParameters();
-            try
-            {
-                if (string.IsNullOrEmpty(formattedIid)) return -1;
+            byte[] pkeyData = new byte[88];
+            Buffer.BlockCopy(BitConverter.GetBytes(groupID), 0, pkeyData, 16, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(serial), 0, pkeyData, 24, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(securityID), 0, pkeyData, 32, 8);
 
-                string rawDigits = IidHelper.StripCheckDigits(formattedIid);
-                byte[] decodedShifted23 = IidHelper.DecimalStringToBinary(rawDigits, 23);
-                byte[] decodedCipher22 = IidHelper.UnshiftBlock(decodedShifted23);
-                EncryptionContextHelper.Process(22, decodedCipher22, true);
+            byte[] cipherBlock;
+            long hr = InstallationIdManager.BuildAndEncryptCipherBlock(pkeyData, hwid, out cipherBlock);
+            if (hr != 0) return (int)hr;
 
-                outParams = InstallationIdManager.ReadBackParameters(decodedCipher22);
-                return 0;
-            }
-            catch
-            {
-                return -1;
-            }
+            string rawDecimal = IidHelper.BinaryToDecimalString(cipherBlock, 179);
+            formattedIid = IidHelper.FormatInstallationId(rawDecimal);
+            return 0;
+        }
+        catch
+        {
+            return -2;
         }
     }
-}
+    public static int ReadParametersFromString(
+        string formattedIid,
+        out DecodedParameters outParams
+    )
+    {
+        outParams = new DecodedParameters();
+        try
+        {
+            if (string.IsNullOrEmpty(formattedIid)) return -1;
 
+            string rawDigits = IidHelper.StripCheckDigits(formattedIid);
+            byte[] decodedShifted23 = IidHelper.DecimalStringToBinary(rawDigits, 23);
+            byte[] decodedCipher22 = IidHelper.UnshiftBlock(decodedShifted23);
+            EncryptionContextHelper.Process(22, decodedCipher22, true);
+
+            outParams = InstallationIdManager.ReadBackParameters(decodedCipher22);
+            return 0;
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+    public static ulong FindSecurityIdLegacy(
+        string targetIid,
+        ulong startSecurity,
+        ulong endSecurity)
+    {
+        DecodedParameters decodedParams;
+        int decodeStatus = MSFT.ReadParametersFromString(targetIid, out decodedParams);
+
+        if (decodeStatus != 0)
+        {
+            throw new ArgumentException("Failed to decode the provided target Installation ID.", nameof(targetIid));
+        }
+
+        uint groupID = decodedParams.groupID;
+        uint serial = decodedParams.serial;
+        long hwid = decodedParams.hwid;
+
+        int processorCount = Environment.ProcessorCount;
+        ulong totalRange = (endSecurity - startSecurity) + 1;
+        ulong chunkSize = totalRange / (ulong)processorCount;
+
+        Console.WriteLine($"[Log] Starting search across range {startSecurity} to {endSecurity} using {processorCount} threads.");
+
+        ulong foundSecurity = 0;
+        int foundFlag = 0;
+        ManualResetEvent doneEvent = new ManualResetEvent(false);
+        int activeThreads = processorCount;
+
+        for (int i = 0; i < processorCount; i++)
+        {
+            int threadIndex = i;
+            ulong chunkStart = startSecurity + ((ulong)threadIndex * chunkSize);
+            ulong chunkEnd = (threadIndex == processorCount - 1) ? endSecurity : chunkStart + chunkSize - 1;
+
+            Console.WriteLine($"[Log] Thread {threadIndex} assigned range: {chunkStart} - {chunkEnd}");
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    for (ulong securityID = chunkStart; securityID <= chunkEnd; securityID++)
+                    {
+                        if (Thread.VolatileRead(ref foundFlag) == 1)
+                            break;
+
+                        string formattedIid;
+                        int result = MSFT.GetInstallationIdString(groupID, serial, securityID, hwid, out formattedIid);
+
+                        if (result == 0 && formattedIid == targetIid)
+                        {
+                            lock (_lockObj)
+                            {
+                                if (foundFlag == 0)
+                                {
+                                    foundSecurity = securityID;
+                                    Thread.VolatileWrite(ref foundFlag, 1);
+                                    Console.WriteLine($"[Log] Match found! Security ID: {securityID} by Thread {threadIndex}");
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                finally
+                {
+                    if (Interlocked.Decrement(ref activeThreads) == 0)
+                    {
+                        doneEvent.Set();
+                    }
+                }
+            });
+        }
+
+        doneEvent.WaitOne();
+        Console.WriteLine("[Log] Search completed.");
+        return foundSecurity;
+    }
+}
 public class IidHelper
 {
     public static byte[] DecimalStringToBinary(string decimalStr, int byteCount)
@@ -199,7 +278,6 @@ public class IidHelper
         return cipher;
     }
 }
-
 public class Sha1Helper
 {
     private readonly IncrementalHash _hasher;
@@ -225,7 +303,6 @@ public class Sha1Helper
         Buffer.BlockCopy(hash, 0, digest, 0, Math.Min(hash.Length, digest.Length));
     }
 }
-
 public class EncryptionContextHelper
 {
     private static void GetDefaultContext(uint[] roundKeys)
@@ -242,7 +319,6 @@ public class EncryptionContextHelper
             roundKeys[i * 2 + 1] = (uint)(constants[i] >> 32);
         }
     }
-
     private static int RunRoundHash(byte[] block, int blockSize, uint roundKey, int bitLen, byte[] outputHash)
     {
         Sha1Helper sha1 = new Sha1Helper();
@@ -269,7 +345,6 @@ public class EncryptionContextHelper
         }
         return 0;
     }
-
     public static int Process(uint size, byte[] data, bool decrypt = false)
     {
         uint halfSize = size >> 1;
@@ -321,15 +396,6 @@ public class EncryptionContextHelper
         return 0;
     }
 }
-
-public struct DecodedParameters
-{
-    public uint securityID;
-    public ushort groupID;
-    public uint serial;
-    public long hwid;
-}
-
 public class InstallationIdManager
 {
     public static long BuildAndEncryptCipherBlock(byte[] pKeyDataStruct, long hwid, out byte[] outCipherBlock)
@@ -390,9 +456,9 @@ public class InstallationIdManager
             v21++; v22Idx++; v23--;
         } while (v23 > 0);
 
-        outCipherBlock[10] = (byte)((32 * (var50 >> 24)) | (outCipherBlock[10] & 0x1F));
-        uint seqVal = BitConverter.ToUInt32(pKeyDataStruct, 28);
         byte byte3_v50 = (byte)(var50 >> 24);
+        outCipherBlock[10] = (byte)((32 * byte3_v50) | (outCipherBlock[10] & 0x1F));
+        uint seqVal = BitConverter.ToUInt32(pKeyDataStruct, 28);
         outCipherBlock[11] = (byte)(((seqVal != 0) ? 8 : 0) | ((outCipherBlock[11] & 0xF0) ^ ((byte3_v50 >> 3) & 7)));
 
         byte[] hwidBytes = BitConverter.GetBytes(hwid);
