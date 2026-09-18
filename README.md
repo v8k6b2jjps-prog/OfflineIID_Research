@@ -106,14 +106,14 @@ Serial B (0x40)  : 673552 (0xA4710)
 Serial Full      : 69673552
 
 --- Total: 128 bytes | Alignment: 16x ---
-0000 : 01 00 00 00 00 00 00 00 84 66 D7 67 3C 01 00 00
-0010 : E0 83 7C 56 66 47 DD 01 50 22 27 04 00 00 00 00
+0000 : 01 00 00 00 00 00 00 00 94 FC 52 E2 8C 02 00 00
+0010 : 60 01 F0 B0 B3 47 DD 01 50 22 27 04 00 00 00 00
 0020 : 00 00 00 00 00 00 00 00 95 15 73 B8 F6 A2 0B 43
 0030 : A7 99 FB FF B8 1A 8D 73 BD 00 00 00 45 00 00 00
 0040 : 10 47 0A 00 00 00 00 00 4F 03 00 00 00 00 00 00
 0050 : 01 00 00 00 01 00 00 00 67 DE 1C 56 9C 03 AE E2
 0060 : B7 87 63 E4 69 E2 02 00 A0 44 4E 88 A7 01 00 00
-0070 : 00 00 00 00 00 00 00 00 30 1B F5 67 3C 01 00 00
+0070 : 00 00 00 00 00 00 00 00 A0 3A 8F EB 8C 02 00 00
 
 Invoking Base Math Parser (sub_1800090B0)...
 Math Layer HRESULT: 0x0
@@ -149,6 +149,12 @@ Group    : 189
 Serial   : 69673552
 Security : 847
 
+=== Invoke-Validator App ===
+Status       : Valid Key
+Upgrade Flag : 0
+Serial       : 69673552 (0x4272250)
+Security ID  : 847 (0x34F)
 
-PS C:\Users\Administrator> 
+
+PS D:\Software\MS Tools Pack\Product Key Tools\MSFT_2005_IID\Validator>  
 ````
