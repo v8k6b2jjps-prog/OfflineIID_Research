@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 
+# https://github.com/massgravel
+# https://github.com/massgravel/spp-stuff
+
 import hashlib
 
 IID_KEY = bytes([
