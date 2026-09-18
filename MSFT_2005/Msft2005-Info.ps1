@@ -8,6 +8,9 @@ using namespace System.Collections.Generic
 using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
 
+Add-Type -AssemblyName System.Xml.Linq
+
+# Group, Bink, CD-KEY
 <#
  Etc, How it find the key.
  sub_18000E8E8, >> 
@@ -33,6 +36,7 @@ SO, it compare our info Raw msft 2005 info to << PublicKeyValue
 Same ????, now you can decrypt the binary, and you also have the << <pkc:GroupId
 #>
 
+# Structs
 <#
 typedef struct _MSFT_PKEY_DATA {
     uint64_t Reserved;             // 0x00 (0x20 relative to PID_OBJ)
@@ -137,6 +141,128 @@ Function Install-NativeModule {
     } catch {
     }
 }
+function Get-PKeyConfigData {
+    <#
+    .SYNOPSIS
+        Extracts Public Key configurations and Group IDs from a pkeyconfig.xrm-ms file.
+    .DESCRIPTION
+        Reads the outer xrm-ms XML, locates the base64-encoded 'pkeyConfigData' infoBin,
+        decodes and parses the inner XML, then iterates over all PublicKey elements 
+        to extract the GroupId and convert the PublicKeyValue into a byte array.
+    .PARAMETER FilePath
+        The path to the pkeyconfig.xrm-ms file.
+    .EXAMPLE
+        Get-PKeyConfigData -FilePath "C:\Path\To\pkeyconfig.xrm-ms"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
+        [Alias('FullName')]
+        [string]$FilePath
+    )
+
+    process {
+        if (-not (Test-Path $FilePath)) {
+            Write-Error "File not found: $FilePath"
+            return
+        }
+
+        try {
+            # Load outer XML document natively
+            [xml]$xdoc = Get-Content -Path $FilePath -Raw
+
+            # Create a NamespaceManager for the outer XML prefixes (tm)
+            $nsMgr = New-Object System.Xml.XmlNamespaceManager($xdoc.NameTable)
+            $nsMgr.AddNamespace("tm", "http://www.microsoft.com/DRM/Metadata/2/1")
+
+            # Select the specific infoBin node using XPath
+            $infoBin = $xdoc.SelectSingleNode("//*[local-name()='infoBin' and @name='pkeyConfigData']", $nsMgr)
+
+            if (-not $infoBin) {
+                Write-Error "Could not find 'pkeyConfigData' infoBin node in the XML."
+                return
+            }
+
+            # Extract and decode the base64 payload
+            $base64Data = $infoBin.InnerText.Trim()
+            $decodedBytes = [System.Convert]::FromBase64String($base64Data)
+
+            # Convert decoded bytes to string (handling UTF-8 / Unicode)
+            $innerXmlString = [System.Text.Encoding]::UTF8.GetString($decodedBytes)
+            if ($innerXmlString -notmatch "ProductKeyConfiguration") {
+                $innerXmlString = [System.Text.Encoding]::Unicode.GetString($decodedBytes)
+            }
+
+            # Parse the inner XML configuration string
+            [xml]$innerXDoc = $innerXmlString
+
+            # Loop through all PublicKey nodes using local-name() to bypass namespace prefixes (pkc:)
+            $publicKeys = $innerXDoc.SelectNodes("//*[local-name()='PublicKey']")
+
+            $results = foreach ($pk in $publicKeys) {
+                $groupId = $pk.SelectSingleNode("*[local-name()='GroupId']").InnerText.Trim()
+                $pubKeyValueBase64 = $pk.SelectSingleNode("*[local-name()='PublicKeyValue']").InnerText.Trim()
+
+                if ($pubKeyValueBase64) {
+                    # Base64 decode the PublicKeyValue data into a true Byte array
+                    $pubKeyBytes = [System.Convert]::FromBase64String($pubKeyValueBase64)
+
+                    [PSCustomObject]@{
+                        GroupId        = $groupId
+                        PublicKeyBytes = $pubKeyBytes
+                        ByteLength     = $pubKeyBytes.Length
+                    }
+                }
+            }
+
+            Write-Verbose "Successfully processed $($results.Count) public keys from $FilePath"
+            
+            # Output results to pipeline
+            return $results
+        }
+        catch {
+            Write-Error "An error occurred during parsing of '$FilePath': $_"
+        }
+    }
+}
+function EncodeBinaryKey([string]$CdKey) {
+        $Alphabet = "BCDFGHJKMPQRTVWXY2346789"
+        $RawKey = $CdKey.Replace("-", "").ToUpper()
+        if ($RawKey.Length -ne 25) { throw "Key must be 25 characters." }
+
+        $Digits = New-Object byte[] 25
+        $isNKey_ = $false
+        $digitCount = 0
+
+        foreach ($char in $RawKey.ToCharArray()) {
+            if ($char -eq 'N' -and -not $isNKey_) {
+                $isNKey_ = $true
+                for ($i = $digitCount; $i -gt 0; $i--) {
+                    $Digits[$i] = $Digits[$i-1]
+                }
+                $Digits[0] = [byte]$digitCount
+                $digitCount++
+                continue
+            }
+            $val = $Alphabet.IndexOf($char)
+            if ($val -lt 0) { throw "Invalid character in key: $char" }
+            $Digits[$digitCount] = [byte]$val
+            $digitCount++
+        }
+
+        $Binary = New-Object byte[] 16
+        foreach ($digit in $Digits) {
+            $carry = [uint32]$digit
+            for ($i = 0; $i -lt 16; $i++) {
+                $res = ($Binary[$i] * 24) + $carry
+                $Binary[$i] = [byte]($res -band 0xFF)
+                $carry = $res -shr 8
+            }
+        }
+
+        if ($isNKey_) { $Binary[14] = $Binary[14] -bor 0x08 }
+        return $Binary
+    }
 
 if (!([PSTypeName]'NativeInterop').Type) {
   Add-Type -TypeDefinition @"
@@ -191,12 +317,15 @@ try {
 Clear-Host
 Write-Host
 
+Set-Location $PSScriptRoot
+
 $CdKey   = 'RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289'
 $DllPath = Join-Path $PSScriptRoot "pidgenx64.dll"
 $CfgPath = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
 $iid2005 = Join-Path $PSScriptRoot "iid2005.py"
 $valPath = Join-Path $PSScriptRoot "Validator"
 $valExe  = Join-Path $PSScriptRoot "Validator\Validator.exe"
+$valxExe = Join-Path $PSScriptRoot "Validator\MiniValidator.exe"
 $hModule = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $DllPath
 
 $tmpPtr  = New-IntPtr -Size 8
@@ -400,6 +529,63 @@ Write-Host
 Write-Host "=== Invoke-Validator App ===" -ForegroundColor Green
 Set-Location $valPath
 & $valExe
+
+$keys = Get-PKeyConfigData -FilePath $CfgPath
+if (-not $keys) {
+    return
+}
+
+# first version, do not remove
+<#
+Write-Host
+Write-Host "=== Enum Config & Validate ===" -ForegroundColor Green
+
+Set-Location $PSScriptRoot
+$KeyData = EncodeBinaryKey -CdKey $CdKey
+[System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot "KeyData.Bin"), $KeyData)
+
+$foundValid = $false
+
+foreach ($res in $keys) {
+    $Bink = $res.PublicKeyBytes
+    [System.IO.File]::WriteAllBytes((Join-Path $PSScriptRoot "Bink.Bin"), $Bink)
+    
+    $results = & cmd /c Validator.exe 2>&1
+    
+    if ($results -match 'Signature mismatch') {
+        continue
+    }
+
+    Write-Host
+    # Print validator results cleanly indented
+    foreach ($line in $results) {
+        if (-not [string]::IsNullOrWhiteSpace($line)) {
+            Write-Host "  $line"
+        }
+    }
+    
+    # Match the property-value formatting style
+    Write-Host "  Group ID     : $($res.GroupId)"
+    Write-Host "  Key Size     : $($res.ByteLength) bytes"
+    
+    $foundValid = $true
+    break
+}
+
+# Cleanup temporary files safely
+foreach ($file in @("Bink.Bin", "KeyData.Bin")) {
+    $filePath = Join-Path $PSScriptRoot $file
+    if (Test-Path $filePath) { [System.IO.File]::Delete($filePath) }
+}
+
+if (-not $foundValid) {
+    Write-Host "  [!] No matching Public Key found for this product key." -ForegroundColor Yellow
+}
+#>
+
+Write-Host
+Write-Host "=== Enum Config & Validate ===" -ForegroundColor Green
+& $valxExe $CdKey $CfgPath
 
 Write-Host
 return
