@@ -1,0 +1,70 @@
+
+Loading 7601 Configuration Rules...
+Loader Return HRESULT: 0x0
+
+Invoking sub_180009338 Directly...
+Direct Subroutine HRESULT: 0x0
+
+--- Decoded Fields ---
+IsUpgrade    : No
+Group ID     : 189 (0xBD)
+Serial       : 69673552 (0x4272250)
+Security     : 847 (0x34F)
+Final String : msft2005:a0cde89c-3304-4157-b61c-c8ad785d1fad&oEROiKcBAAAAAAAA
+
+Serial A (0x3C)  : 69 (0x45)
+Serial B (0x40)  : 673552 (0xA4710)
+Serial Full      : 69673552
+
+--- Total: 128 bytes | Alignment: 16x ---
+0000 : 01 00 00 00 00 00 00 00 94 FC 52 E2 8C 02 00 00
+0010 : 60 01 F0 B0 B3 47 DD 01 50 22 27 04 00 00 00 00
+0020 : 00 00 00 00 00 00 00 00 95 15 73 B8 F6 A2 0B 43
+0030 : A7 99 FB FF B8 1A 8D 73 BD 00 00 00 45 00 00 00
+0040 : 10 47 0A 00 00 00 00 00 4F 03 00 00 00 00 00 00
+0050 : 01 00 00 00 01 00 00 00 67 DE 1C 56 9C 03 AE E2
+0060 : B7 87 63 E4 69 E2 02 00 A0 44 4E 88 A7 01 00 00
+0070 : 00 00 00 00 00 00 00 00 A0 3A 8F EB 8C 02 00 00
+
+Invoking Base Math Parser (sub_1800090B0)...
+Math Layer HRESULT: 0x0
+
+--- Raw v75 Buffer Extraction Results ---
+--- Total: 96 bytes | Alignment: 16x ---
+0000 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0010 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0020 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0030 : 01 00 00 00 00 00 00 00 67 DE 1C 56 9C 03 AE E2
+0040 : B7 87 63 E4 69 E2 02 00 00 00 00 00 00 00 00 00
+0050 : 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+Re-manufacturing the 12-Byte Material Block...
+
+--- Raw Material Structure (Before Base64) ---
+--- Total: 12 bytes | Alignment: 4x ---
+0000 : A0 44 4E 88
+0004 : A7 01 00 00
+0008 : 00 00 00 00
+
+--- Base64 Encoded Result ---
+oEROiKcBAAAAAAAA
+
+--- Base64 Encoded Result ---
+oEROiKcBAAAAAAAA
+
+--- Re-Encoding Fields into IID String ---
+Generated IID String : 000460905700891320147206820892334080734521881891085022
+
+=== DEBUG: Running Python Decoder ===
+Group    : 189
+Serial   : 69673552
+Security : 847
+
+=== Invoke-Validator App ===
+Status       : Valid Key
+Upgrade Flag : 0
+Serial       : 69673552 (0x4272250)
+Security ID  : 847 (0x34F)
+
+
+PS D:\Software\MS Tools Pack\Product Key Tools\MSFT_2005_IID\Validator> 

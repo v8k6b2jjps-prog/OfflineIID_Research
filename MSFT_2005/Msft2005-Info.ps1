@@ -195,6 +195,8 @@ $CdKey   = 'RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289'
 $DllPath = Join-Path $PSScriptRoot "pidgenx64.dll"
 $CfgPath = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
 $iid2005 = Join-Path $PSScriptRoot "iid2005.py"
+$valPath = Join-Path $PSScriptRoot "Validator"
+$valExe  = Join-Path $PSScriptRoot "Validator\Validator.exe"
 $hModule = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $DllPath
 
 $tmpPtr  = New-IntPtr -Size 8
@@ -229,14 +231,11 @@ $HeapPtr = [Marshal]::ReadIntPtr($OutObjPtr)
 if ([long]$HeapPtr -le 0) { return }
 
 # Parse and Extract Struct Metadata Fields
-$KeyIDValue       = [Marshal]::ReadInt32($HeapPtr, 0x18) # Serial
-$GroupIDValue     = [Marshal]::ReadByte($HeapPtr,  0x38) # Group
-$OperationalFlags = [Marshal]::ReadInt64($HeapPtr, 0x48) # Security
-$LicenseFlags     = [Marshal]::ReadInt32($HeapPtr, 0x44) # Flags
-
-# Extract the Security / Auth value (10 bits from OperationalFlags)
-$SecurityValue    = [int]($OperationalFlags -band 0x3FF)
-$UpgradeText      = if (($LicenseFlags -band 0x1) -eq 1) { "Yes" } else { "No" }
+$KeyIDValue    = [Marshal]::ReadInt32($HeapPtr, 0x18) # Serial
+$GroupIDValue  = [Marshal]::ReadByte($HeapPtr,  0x38) # Group
+$SecurityValue = [Marshal]::ReadInt64($HeapPtr, 0x48) # Security
+$LicenseFlags  = [Marshal]::ReadInt32($HeapPtr, 0x44) # Flags
+$UpgradeText   = if (($LicenseFlags -band 0x1) -eq 1) { "Yes" } else { "No" }
 
 # NEW: Read the nested pointer at offset +8, then decode the Wide String
 $StringPtr        = [Marshal]::ReadIntPtr($HeapPtr, 8)
@@ -396,6 +395,11 @@ if ($pythonCmd) {
     Write-Host "Python executable not found in PATH. Skipping automated validation step." -ForegroundColor Yellow
     Write-Host "Generated IID can still be verified manually." -ForegroundColor DarkGray
 }
+
+Write-Host
+Write-Host "=== Invoke-Validator App ===" -ForegroundColor Green
+Set-Location $valPath
+& $valExe
 
 Write-Host
 return
