@@ -585,7 +585,18 @@ if (-not $foundValid) {
 
 Write-Host
 Write-Host "=== Enum Config & Validate ===" -ForegroundColor Green
+
+# Start stopwatch timer
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# Run the executable
 & $valxExe $CdKey $CfgPath
 
-Write-Host
+# Stop timer
+$stopwatch.Stop()
+
+# Display elapsed time
+Write-Host "----------------------------------------" -ForegroundColor DarkGray
+Write-Host "Execution Time: $($stopwatch.Elapsed.TotalSeconds.ToString('F2')) seconds" -ForegroundColor Cyan
+
 return
