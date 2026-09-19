@@ -322,10 +322,10 @@ Set-Location $PSScriptRoot
 $CdKey   = 'RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289'
 $DllPath = Join-Path $PSScriptRoot "pidgenx64.dll"
 $CfgPath = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
-$iid2005 = Join-Path $PSScriptRoot "iid2005.py"
-$valPath = Join-Path $PSScriptRoot "Validator"
-$valExe  = Join-Path $PSScriptRoot "Validator\Validator.exe"
-$valxExe = Join-Path $PSScriptRoot "Validator\MiniValidator.exe"
+$iid2005 = Join-Path $PSScriptRoot "Binary\iid2005.py"
+$valPath = Join-Path $PSScriptRoot "Binary"
+$valExe  = Join-Path $PSScriptRoot "Binary\Validator.exe"
+$valxExe = Join-Path $PSScriptRoot "Binary\MiniValidator.exe"
 $hModule = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $DllPath
 
 $tmpPtr  = New-IntPtr -Size 8
