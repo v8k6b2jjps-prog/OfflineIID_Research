@@ -1,0 +1,3 @@
+#define IDR_MY_DLL 101
+
+IDR_MY_DLL RCDATA "PidKeyData.dll"
