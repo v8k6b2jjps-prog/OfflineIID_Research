@@ -44,43 +44,58 @@ $readResult = [Msft2009.MSFT]::ReadParametersFromString($generatedIid, [ref]$dec
 ````
 ## Test Results
 ````
-GAC    Version        Location                                                                                                                                                                                                                  
----    -------        --------                                                                                                                                                                                                                  
-False  v4.0.30319     D:\Software\MS Tools Pack\Product Key Tools\MSFT_2009\Testing\Msft2009.dll                                                                                                                                                
 
 Extract HWID Value :  -7066209111506718658
 Store HWID Value   :  -7066209111506718658
 WinRT HWID Value   :  -7066209111506718658
 
-
 --- Encode Values ---
-Group ID:    5150
-Serial:      80009470
-Security ID: 34969266479148
-HWID:        -7066209111506718658
 
-Msft Dll Call results    : 631267238851209650325063288122616649605340181386226574961832720
+Group ID    : 3281
+Serial      : 1
+Security ID : 2710516900138904
+HWID        : -7066209111506718658
 
-Msft C# Dll Call results : 631267238851209650325063288122616649605340181386226574961832720
-
-Pidgen Dll Call results  : 631267238851209650325063288122616649605340181386226574961832720
+Msft ** Dll Call results : 414918377827750666190230041045368316477505839619559685019632243
+Msft C# Dll Call results : 414918377827750666190230041045368316477505839619559685019632243
+Python ID Script results : 414918377827750666190230041045368316477505839619559685019632243
+Pidgen  Dll Call results : 414918377827750666190230041045368316477505839619559685019632243
 
 --- Native DLL Decoded Successfully ---
-Group ID:    5150
-Serial:      80009470
-Security ID: 179626028
-HWID:        -7066209111506718658
+
+Group ID    : 3281
+Serial      : 1
+Security ID : 83726232
+HWID        : -7066209111506718658
 
 --- .Net C# Decoded Successfully ---
-Group ID:    5150
-Serial:      80009470
-Security ID: 179626028
-HWID:        -7066209111506718658
 
-Read / Validate Test .. . . 
+Group ID    : 3281
+Serial      : 1
+Security ID : 83726232
+HWID        : -7066209111506718658
+
+--- Python IID Decoded Results ---
+
+Group    : 3281
+Serial   : 1
+Security : 0x9a1???4fd8f98
+HWID     : -7066209111506718658
+
+--- Python IID Recover Results ---
+
+NW6C2-QMPVW-D7KKK-3GKT6-VCFB2 | 2710516900138904 (0x0009A13364FD8F98)
+CPX6B-DHN4M-4KWTW-9HG66-VCFB2 | 2710666150252440 (0x0009A15624FD8F98)
+YDQVN-7BK9Y-B7HFM-P9V3G-VCFB2 | 2710851639152536 (0x0009A18154FD8F98)
+JY9NB-2KD48-J92BK-2PMQG-VCFB2 | 2710855665684376 (0x0009A18244FD8F98)
+RC8JF-NT3G2-BBJ9M-BTBQG-VCFB2 | 2710880361746328 (0x0009A18804FD8F98)
+NFTT3-RT9BV-292HH-2GWXT-VCFB2 | 2710980219735960 (0x0009A19F44FD8F98)
+4NYCR-PV2VK-82KYD-Q9JXT-VCFB2 | 2711168929861528 (0x0009A1CB34FD8F98)
+F3WKG-MXN83-PJKDK-X4QG6-VCFB2 | 2711183425376152 (0x0009A1CE94FD8F98)
+FHWQM-N7HB2-2VPCR-D3T66-VCFB2 | 2711241675870104 (0x0009A1DC24FD8F98)
+
+In <> Out Test .. . . 
 is IID matching ? True
-
-
 
 PS C:\Users\Administrator> 
 ````
