@@ -12,6 +12,53 @@ public struct DecodedParameters
 public class MSFT
 {
     private static readonly object _lockObj = new object();
+    /// <summary>
+    /// Recovers candidate Security IDs (as Int64/long) for a given Installation ID and key's last 5 characters.
+    /// </summary>
+    /// <summary>
+    /// Decodes the IID and returns all 4096 possible Security ID candidates (as Int64/long).
+    /// </summary>
+    public static long[] Recover(string iid, string last5 = null)
+    {
+        if (string.IsNullOrWhiteSpace(iid))
+            return new long[0];
+
+        // 1. Decode IID parameters
+        DecodedParameters decoded;
+        if (ReadParametersFromString(iid, out decoded) != 0)
+            return new long[0];
+
+        // 2. Decode raw decrypted bytes to extract surviving bits (bits 40..52)
+        string rawDigits = IidHelper.StripCheckDigits(iid);
+        byte[] decodedShifted23 = IidHelper.DecimalStringToBinary(rawDigits, 23);
+        byte[] decodedCipher22 = IidHelper.UnshiftBlock(decodedShifted23);
+        EncryptionContextHelper.Process(22, decodedCipher22, true);
+
+        // Lower 28 bits (0-27)
+        ulong baseSec = decoded.securityID & 0x0FFFFFFFu;
+
+        // Upper bits (40-52)
+        byte nibbleLow = (byte)(decodedCipher22[3] >> 4);
+        byte nibbleMid = (byte)(decodedCipher22[4] & 0x0F);
+        byte nibbleHigh = (byte)(decodedCipher22[4] >> 4);
+        ulong upperVal = (ulong)(nibbleLow | (nibbleMid << 4) | (nibbleHigh << 8));
+
+        baseSec |= (upperVal << 40);
+        baseSec |= ((ulong)(decodedCipher22[5] & 1) << 52);
+
+        // Clear the 12 gap bits (bits 28-39)
+        baseSec &= ~(0xFFFUL << 28);
+
+        // 3. Generate array of all 4096 candidates
+        long[] candidates = new long[4096];
+        for (ulong i = 0; i < 4096; i++)
+        {
+            candidates[i] = (long)(baseSec | (i << 28));
+        }
+
+        return candidates;
+    }
+
     public static int GetInstallationIdString(
             uint groupID,
             uint serial,
