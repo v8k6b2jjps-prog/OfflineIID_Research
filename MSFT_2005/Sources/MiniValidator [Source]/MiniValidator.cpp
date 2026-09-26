@@ -1,25 +1,23 @@
-#define NOMINMAX // <--- Add this before windows.h
+﻿#define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <wincrypt.h>
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <stdint.h>
 #include <algorithm>
-#include <objbase.h>
 #include <thread>
 #include <atomic>
-#include <mutex>
 #include <chrono>
+
+#include "resource.h"
 
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ole32.lib")
 
-#define IDR_MY_DLL 101
-
-// Function pointer definitions for PidKeyData.dll (x86 __fastcall convention)
 typedef int(__fastcall* PubkeyParserDelegate)(intptr_t* pDstMem, unsigned char* PublicKeyBytes, unsigned int dwSize, int* retValue);
 typedef int(__fastcall* CalculateH1Delegate)(unsigned char* pMem1, unsigned char* pMem2, unsigned char* PID3Array, unsigned char* isValid, unsigned char* h1Coeffs, int* retValue);
 typedef int(__fastcall* ExtractMDelegate)(unsigned char* pMem1, unsigned char* h1Coeffs, unsigned char* M, int* retValue);
@@ -36,31 +34,36 @@ struct PublicKeyEntry {
     std::vector<unsigned char> pubKeyBytes;
 };
 
-// Helper: Base64 decode string to byte vector using Win32 API
-std::vector<unsigned char> Base64Decode(const std::string& in) {
+// Fast Base64 decoder using Win32 API
+std::vector<unsigned char> Base64Decode(std::string_view sv) {
     DWORD outLen = 0;
-    if (!CryptStringToBinaryA(in.data(), (DWORD)in.size(), CRYPT_STRING_BASE64, NULL, &outLen, NULL, NULL)) {
+    if (!CryptStringToBinaryA(sv.data(), (DWORD)sv.size(), CRYPT_STRING_BASE64, NULL, &outLen, NULL, NULL)) {
         return {};
     }
     std::vector<unsigned char> out(outLen);
-    CryptStringToBinaryA(in.data(), (DWORD)in.size(), CRYPT_STRING_BASE64, out.data(), &outLen, NULL, NULL);
+    if (!CryptStringToBinaryA(sv.data(), (DWORD)sv.size(), CRYPT_STRING_BASE64, out.data(), &outLen, NULL, NULL)) {
+        return {};
+    }
     out.resize(outLen);
     return out;
 }
 
-// Helper: Extract content between XML tags
-std::string ExtractBetween(const std::string& str, const std::string& startTag, const std::string& endTag, size_t& offset) {
-    size_t start = str.find(startTag, offset);
-    if (start == std::string::npos) return "";
-    start += startTag.length();
-    size_t end = str.find(endTag, start);
-    if (end == std::string::npos) return "";
-    offset = end + endTag.length();
-    return str.substr(start, end - start);
+// Fast Base64 encoder using Win32 API
+std::string Base64Encode(const unsigned char* data, DWORD len) {
+    DWORD outLen = 0;
+    if (!CryptBinaryToStringA(data, len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &outLen)) {
+        return "";
+    }
+    std::string out(outLen, '\0');
+    if (!CryptBinaryToStringA(data, len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &out[0], &outLen)) {
+        return "";
+    }
+    out.resize(outLen);
+    return out;
 }
 
 // CD-Key Base-24 Encoder
-std::vector<unsigned char> EncodeBinaryKey(std::string cdKey) {
+std::vector<unsigned char> EncodeBinaryKey(const std::string& cdKey) {
     std::string alphabet = "BCDFGHJKMPQRTVWXY2346789";
     std::string rawKey = "";
     for (char c : cdKey) {
@@ -111,7 +114,7 @@ std::vector<unsigned char> EncodeBinaryKey(std::string cdKey) {
     return binary;
 }
 
-// Helper to extract DLL from resource to disk and load it
+// Extract embedded DLL to disk for loading
 HMODULE ExtractAndLoadDll(LPCWSTR dllFileName) {
     HRSRC hRes = FindResourceW(NULL, MAKEINTRESOURCE(IDR_MY_DLL), RT_RCDATA);
     if (!hRes) return NULL;
@@ -130,25 +133,173 @@ HMODULE ExtractAndLoadDll(LPCWSTR dllFileName) {
     if (lastSlash) *(lastSlash + 1) = L'\0';
     wcscat(dllPath, dllFileName);
 
-    HANDLE hFile = CreateFileW(dllPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return NULL;
-
-    DWORD written = 0;
-    WriteFile(hFile, pData, dwSize, &written, NULL);
-    CloseHandle(hFile);
+    if (GetFileAttributesW(dllPath) == INVALID_FILE_ATTRIBUTES) {
+        HANDLE hFile = CreateFileW(dllPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(hFile, pData, dwSize, &written, NULL);
+            CloseHandle(hFile);
+        }
+    }
 
     return LoadLibraryW(dllPath);
+}
+
+// High-speed Memory-Mapped File Loader
+std::string LoadFileFast(const std::string& path) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        return "";
+    }
+
+    HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMapping) {
+        CloseHandle(hFile);
+        return "";
+    }
+
+    const char* pData = (const char*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+    std::string content;
+    if (pData) {
+        content.assign(pData, fileSize);
+        UnmapViewOfFile((void*)pData);
+    }
+
+    CloseHandle(hMapping);
+    CloseHandle(hFile);
+    return content;
+}
+
+// Helper to retrieve Performance Core (P-core) affinity masks
+std::vector<DWORD_PTR> GetPerformanceCoreMasks() {
+    std::vector<DWORD_PTR> pCoreMasks;
+    DWORD len = 0;
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len) && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        std::vector<BYTE> buf(len);
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf.data(), &len)) {
+            DWORD offset = 0;
+            UCHAR maxEfficiency = 0;
+
+            while (offset < len) {
+                auto info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + offset);
+                if (info->Relationship == RelationProcessorCore) {
+                    if (info->Processor.EfficiencyClass > maxEfficiency) {
+                        maxEfficiency = info->Processor.EfficiencyClass;
+                    }
+                }
+                offset += info->Size;
+            }
+
+            offset = 0;
+            while (offset < len) {
+                auto info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + offset);
+                if (info->Relationship == RelationProcessorCore) {
+                    if (info->Processor.EfficiencyClass == maxEfficiency || maxEfficiency == 0) {
+                        for (WORD i = 0; i < info->Processor.GroupCount; ++i) {
+                            pCoreMasks.push_back(info->Processor.GroupMask[i].Mask);
+                        }
+                    }
+                }
+                offset += info->Size;
+            }
+        }
+    }
+    return pCoreMasks;
+}
+
+bool ParseKeyEntriesSimple(const std::string& outerXml, std::vector<PublicKeyEntry>& pkEntries) {
+    size_t infoBinPos = outerXml.find("pkeyConfigData");
+    if (infoBinPos == std::string::npos) return false;
+
+    size_t contentStart = outerXml.find('>', infoBinPos) + 1;
+    size_t contentEnd = outerXml.find("</", contentStart);
+    std::string_view base64InfoBin(&outerXml[contentStart], contentEnd - contentStart);
+
+    std::string cleanedB64;
+    cleanedB64.reserve(base64InfoBin.size());
+    for (char c : base64InfoBin) {
+        if (!isspace((unsigned char)c)) cleanedB64.push_back(c);
+    }
+
+    std::vector<unsigned char> decodedInnerBytes = Base64Decode(cleanedB64);
+    if (decodedInnerBytes.empty()) return false;
+
+    std::string innerXml(decodedInnerBytes.begin(), decodedInnerBytes.end());
+    if (innerXml.find("ProductKeyConfiguration") == std::string::npos) {
+        if (decodedInnerBytes.size() > 2 && decodedInnerBytes[1] == 0) {
+            std::wstring wstr((wchar_t*)decodedInnerBytes.data(), decodedInnerBytes.size() / 2);
+            innerXml = std::string(wstr.begin(), wstr.end());
+        }
+    }
+
+    std::string_view innerSv = innerXml;
+    size_t searchPos = 0;
+    while (true) {
+        // Find start of public key block safely
+        size_t pkStart = innerSv.find("<pkc:PublicKey>", searchPos);
+        if (pkStart == std::string_view::npos) {
+            pkStart = innerSv.find("<PublicKey>", searchPos);
+            if (pkStart == std::string::npos) break;
+        }
+
+        // Find end of public key block safely
+        size_t pkEnd = innerSv.find("</pkc:PublicKey>", pkStart);
+        if (pkEnd == std::string::npos) {
+            pkEnd = innerSv.find("</PublicKey>", pkStart);
+            if (pkEnd == std::string::npos) break;
+            pkEnd += sizeof("</PublicKey>") - 1;
+        }
+        else {
+            pkEnd += sizeof("</pkc:PublicKey>") - 1;
+        }
+
+        std::string_view block = innerSv.substr(pkStart, pkEnd - pkStart);
+        searchPos = pkEnd;
+
+        // Extract GroupId
+        std::string groupId = "";
+        size_t gStart = block.find("GroupId>");
+        if (gStart == std::string_view::npos) gStart = block.find(":GroupId>");
+        if (gStart != std::string_view::npos) {
+            gStart = block.find('>', gStart) + 1;
+            size_t gEnd = block.find("</", gStart);
+            groupId = std::string(block.substr(gStart, gEnd - gStart));
+        }
+
+        // Extract PublicKeyValue
+        size_t kStart = block.find("PublicKeyValue>");
+        if (kStart == std::string_view::npos) kStart = block.find(":PublicKeyValue>");
+        if (kStart != std::string_view::npos) {
+            kStart = block.find('>', kStart) + 1;
+            size_t kEnd = block.find("</", kStart);
+            std::string_view rawKeyB64 = block.substr(kStart, kEnd - kStart);
+
+            std::string cleanKeyB64;
+            cleanKeyB64.reserve(rawKeyB64.size());
+            for (char c : rawKeyB64) {
+                if (!isspace((unsigned char)c)) cleanKeyB64.push_back(c);
+            }
+
+            std::vector<unsigned char> pubKeyBytes = Base64Decode(cleanKeyB64);
+            if (pubKeyBytes.size() == 1579) {
+                pkEntries.push_back({ groupId, pubKeyBytes });
+            }
+        }
+    }
+
+    return !pkEntries.empty();
 }
 
 int main(int argc, char* argv[]) {
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\PKeyValidator_SingleInstance_Mutex");
     if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
-        std::cerr << "Error: Another instance of this application is already running." << std::endl;
         if (hMutex) CloseHandle(hMutex);
         return 1;
     }
-
-    std::cout << "=== Native C++ PKey Config Enumerator & Validator ===" << std::endl;
 
     if (argc < 2) {
         std::cout << "Usage: PKeyValidator.exe <CD-KEY> [ConfigFilePath]" << std::endl;
@@ -164,52 +315,12 @@ int main(int argc, char* argv[]) {
     try {
         encData = EncodeBinaryKey(cdKey);
     }
-    catch (const std::exception& e) {
-        std::cerr << "Error encoding CD-Key: " << e.what() << std::endl;
+    catch (...) {
         ReleaseMutex(hMutex);
         CloseHandle(hMutex);
         return 1;
     }
 
-    std::ifstream file(configPath, std::ios::binary);
-    if (!file) {
-        std::cerr << "Failed to open configuration file: " << configPath << std::endl;
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
-        return 1;
-    }
-    std::string outerXml((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    file.close();
-
-    size_t infoBinPos = outerXml.find("pkeyConfigData");
-    if (infoBinPos == std::string::npos) {
-        std::cerr << "Could not find 'pkeyConfigData' inside config file." << std::endl;
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
-        return 1;
-    }
-
-    size_t contentStart = outerXml.find('>', infoBinPos) + 1;
-    size_t contentEnd = outerXml.find("</", contentStart);
-    std::string base64InfoBin = outerXml.substr(contentStart, contentEnd - contentStart);
-    base64InfoBin.erase(remove_if(base64InfoBin.begin(), base64InfoBin.end(), isspace), base64InfoBin.end());
-
-    std::vector<unsigned char> decodedInnerBytes = Base64Decode(base64InfoBin);
-    if (decodedInnerBytes.empty()) {
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
-        return 1;
-    }
-
-    std::string innerXml(decodedInnerBytes.begin(), decodedInnerBytes.end());
-    if (innerXml.find("ProductKeyConfiguration") == std::string::npos) {
-        if (decodedInnerBytes.size() > 2 && decodedInnerBytes[1] == 0) {
-            std::wstring wstr((wchar_t*)decodedInnerBytes.data(), decodedInnerBytes.size() / 2);
-            innerXml = std::string(wstr.begin(), wstr.end());
-        }
-    }
-
-    // Extract and Load DLL
     LPCWSTR dllName = L"PidKeyData_temp.dll";
     HMODULE hModule = ExtractAndLoadDll(dllName);
     if (!hModule) {
@@ -230,58 +341,43 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Gather all PublicKey entries into a collection first (No while(true) during validation logic)
-    std::vector<PublicKeyEntry> pkEntries;
-    size_t searchPos = 0;
-    while (true) {
-        size_t pkStart = innerXml.find("<pkc:PublicKey>", searchPos);
-        if (pkStart == std::string::npos) {
-            pkStart = innerXml.find("<PublicKey>", searchPos);
-            if (pkStart == std::string::npos) break;
-        }
+    auto startTime = std::chrono::high_resolution_clock::now();
 
-        size_t pkEnd = innerXml.find("</pkc:PublicKey>", pkStart);
-        if (pkEnd == std::string::npos) pkEnd = innerXml.find("</PublicKey>", pkStart);
-        if (pkEnd == std::string::npos) break;
-
-        std::string pkBlock = innerXml.substr(pkStart, pkEnd - pkStart);
-        searchPos = pkEnd;
-
-        size_t dummy = 0;
-        std::string groupId = ExtractBetween(pkBlock, "<pkc:GroupId>", "</pkc:GroupId>", dummy);
-        if (groupId.empty()) groupId = ExtractBetween(pkBlock, "<GroupId>", "</GroupId>", dummy);
-
-        dummy = 0;
-        std::string pubKeyB64 = ExtractBetween(pkBlock, "<pkc:PublicKeyValue>", "</pkc:PublicKeyValue>", dummy);
-        if (pubKeyB64.empty()) pubKeyB64 = ExtractBetween(pkBlock, "<PublicKeyValue>", "</PublicKeyValue>", dummy);
-
-        if (!pubKeyB64.empty()) {
-            pubKeyB64.erase(remove_if(pubKeyB64.begin(), pubKeyB64.end(), isspace), pubKeyB64.end());
-            std::vector<unsigned char> pubKeyBytes = Base64Decode(pubKeyB64);
-            if (pubKeyBytes.size() == 1579) {
-                pkEntries.push_back({ groupId, pubKeyBytes });
-            }
-        }
+    std::string outerXml = LoadFileFast(configPath);
+    if (outerXml.empty()) {
+        FreeLibrary(hModule);
+        DeleteFileW(dllName);
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
+        return 1;
     }
 
-    std::cout << "Loaded " << pkEntries.size() << " public key groups. Scanning using all available CPU threads..." << std::endl;
+    std::vector<PublicKeyEntry> pkEntries;
+    if (!ParseKeyEntriesSimple(outerXml, pkEntries)) {
+        FreeLibrary(hModule);
+        DeleteFileW(dllName);
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
+        return 1;
+    }
 
-    // Multi-threaded validation variables
     std::atomic<bool> foundValid(false);
-    std::mutex consoleMutex;
-
-    // Result payload holders
     bool outIsUpgrade = false;
     uint32_t outSerial = 0;
     uint32_t outSecurity = 0;
     std::string outGroupId = "";
     size_t outKeySize = 0;
 
-    unsigned int numThreads = std::thread::hardware_concurrency();
+    std::vector<DWORD_PTR> pCoreMasks = GetPerformanceCoreMasks();
+    size_t numThreads = pCoreMasks.empty() ? std::thread::hardware_concurrency() : pCoreMasks.size();
     if (numThreads == 0) numThreads = 4;
 
-    // Worker lambda for multi-threaded chunk execution
-    auto worker = [&](size_t startIdx, size_t endIdx) {
+    auto worker = [&](size_t threadIndex, size_t startIdx, size_t endIdx) {
+        if (!pCoreMasks.empty()) {
+            SetThreadAffinityMask(GetCurrentThread(), pCoreMasks[threadIndex % pCoreMasks.size()]);
+        }
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
         for (size_t i = startIdx; i < endIdx; ++i) {
             if (foundValid) break;
 
@@ -318,18 +414,15 @@ int main(int argc, char* argv[]) {
         }
         };
 
-    // Spawn threads and partition chunks
     std::vector<std::thread> threads;
     size_t totalItems = pkEntries.size();
     size_t chunkSize = (totalItems + numThreads - 1) / numThreads;
 
-    auto startTime = std::chrono::high_resolution_clock::now();
-
-    for (unsigned int t = 0; t < numThreads; ++t) {
+    for (size_t t = 0; t < numThreads; ++t) {
         size_t start = t * chunkSize;
         size_t end = std::min(start + chunkSize, totalItems);
         if (start < end) {
-            threads.emplace_back(worker, start, end);
+            threads.emplace_back(worker, t, start, end);
         }
     }
 
@@ -342,22 +435,29 @@ int main(int argc, char* argv[]) {
     auto endTime = std::chrono::high_resolution_clock::now();
     double elapsedSeconds = std::chrono::duration<double>(endTime - startTime).count();
 
-    // Output Results
     if (foundValid) {
-        std::cout << "\nStatus       : Valid Key" << std::endl;
+        uint64_t act_hash = (uint64_t)(outIsUpgrade & 0x1);
+        act_hash |= (((uint64_t)outSerial & ((1ULL << 30) - 1)) << 1);
+        act_hash |= (((uint64_t)outSecurity & ((1ULL << 20) - 1)) << 31);
+
+        unsigned char keyData[12] = { 0 };
+        std::memcpy(keyData, &act_hash, sizeof(act_hash));
+        std::string act_data = Base64Encode(keyData, 12);
+
+        std::cout << "Status       : Valid Key" << std::endl;
         std::cout << "Upgrade Flag : " << outIsUpgrade << std::endl;
         std::cout << "Serial       : " << outSerial << " (0x" << std::hex << outSerial << std::dec << ")" << std::endl;
         std::cout << "Security ID  : " << outSecurity << " (0x" << std::hex << outSecurity << std::dec << ")" << std::endl;
         std::cout << "Group ID     : " << outGroupId << std::endl;
         std::cout << "Key Size     : " << outKeySize << " bytes" << std::endl;
+        std::cout << "Act Data     : " << act_data << std::endl;
     }
     else {
-        std::cout << "\nStatus       : Invalid Key (Signature mismatch across " << totalItems << " groups)" << std::endl;
+        std::cout << "Status       : Invalid Key (Mismatch across " << totalItems << " groups)" << std::endl;
     }
 
     std::cout << "Elapsed Time : " << elapsedSeconds << "s" << std::endl;
 
-    // Cleanup DLL
     FreeLibrary(hModule);
     DeleteFileW(dllName);
 
