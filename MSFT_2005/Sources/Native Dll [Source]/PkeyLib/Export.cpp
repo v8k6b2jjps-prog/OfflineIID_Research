@@ -1,4 +1,4 @@
-﻿#include "pch.h"
+#include "pch.h"
 #include "Helper.h"
 #include "BigInteger.h"
 #include "pKeyCalc.h"
@@ -21,7 +21,33 @@
 #define DLL_EXPORT
 #endif
 
-// Internal Base64 decoder for Helper::ParseKeyEntriesSimple[cite: 3, 6]
+// =====================================================================
+// CPU tuning notes (i7-13700KF: 8 P-cores + HT = 16 P-threads, 8 E-cores)
+//
+// The OUTER loop below runs INDEPENDENT groups, so -- unlike the inner
+// MITM chunk split -- it is a throughput problem, not a balance problem.
+// We therefore:
+//   * spread it across all 16 homogeneous P-THREADS (P-cores + their HT
+//     siblings), not just the 8 physical P-cores. HT adds ~20-30% here
+//     because the 8 MB table probes and the modmul dependency chains
+//     leave issue slots the sibling thread can use.
+//   * skip the 8 E-cores on purpose: if the *winning* group landed on a
+//     Gracemont core it would run ~2x slower and stall the whole result
+//     while the P-threads sit idle with nothing left to steal.
+//   * dispatch groups from a shared atomic counter (work-stealing), so a
+//     P-thread that finishes a doomed group immediately grabs the next
+//     one instead of waiting on a static slice.
+//   * force the INNER MITM serial in this mode (FreeSlots = 0): with 16
+//     groups already in flight there are no spare cores to nest into, and
+//     nesting would just oversubscribe. One group == one serial MITM on
+//     one pinned P-thread.
+//
+// The single-group path (targetGroupId set, or a config with one entry)
+// does the opposite: 1 outer worker, inner MITM claims all 8 P-cores and
+// runs fully parallel -- the warm path that beats a serial validator.
+// =====================================================================
+
+// Internal Base64 decoder for Helper::ParseKeyEntriesSimple
 static std::vector<unsigned char> InternalBase64Decode(std::string_view b64) {
     static constexpr int kLookup[] = {
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -66,24 +92,47 @@ static std::vector<unsigned char> InternalBase64Decode(std::string_view b64) {
     return ret;
 }
 
+#ifdef _WIN32
+// One affinity mask per logical P-THREAD (splits each physical P-core mask
+// into its individual HT-lane bits). On the 13700KF this yields 16 masks.
+// Empty on non-hybrid / detection failure -> caller falls back.
+static std::vector<DWORD_PTR> GetPerformanceThreadMasks() {
+    std::vector<DWORD_PTR> out;
+    for (DWORD_PTR m : GetPerformanceCoreMasks()) {
+        while (m) {
+            DWORD_PTR lsb = m & (DWORD_PTR)(~m + 1); // lowest set bit
+            out.push_back(lsb);
+            m &= (m - 1);
+        }
+    }
+    return out;
+}
+#endif
+
 extern "C" {
-    // High-performance Memory-Stream variant (Zero Disk I/O)[cite: 7]
+    // High-performance Memory-Stream variant (Zero Disk I/O)
+    //
+    // targetGroupId: 0  -> scan every group (dynamic, all P-threads)
+    //                >0 -> validate ONLY that group, inner MITM fully parallel
     DLL_EXPORT bool VerifyKeyFromMemory(
         const char* cdKeyStr,
         const char* configXmlData,
         int configXmlLen,
         unsigned char* outUid8Bytes,
-        int* outGroupId
+        int* outGroupId,
+        int targetGroupId
     ) {
         try {
             if (!cdKeyStr || !configXmlData || configXmlLen <= 0 || !outUid8Bytes) {
                 return false;
             }
 
-            // 1. Construct outer XML directly from in-memory byte buffer[cite: 7]
+            // Fresh run: clear any leftover abort flag BEFORE any worker starts,
+            // so it can never race with the winner raising it below.
+            H1Search::Abort.store(0, std::memory_order_relaxed);
+
             std::string outerXml(configXmlData, configXmlLen);
 
-            // 2. Encode CD-Key string into 16-byte binary array[cite: 2]
             std::vector<unsigned char> bEncryptArray;
             try {
                 bEncryptArray = Helper::EncodeBinaryKey(std::string(cdKeyStr));
@@ -91,18 +140,15 @@ extern "C" {
             catch (const std::exception&) {
                 return false;
             }
-
             if (bEncryptArray.size() != 16) {
                 return false;
             }
 
-            // 3. Parse public key entries from XML container[cite: 2, 3]
             std::vector<PublicKeyEntry> pkEntries;
             if (!Helper::ParseKeyEntriesSimple(outerXml, pkEntries, InternalBase64Decode)) {
                 return false;
             }
 
-            // 4. Pre-parse all public keys once upfront[cite: 7]
             struct ParsedEntry {
                 int groupId;
                 PubKey pubKey;
@@ -114,12 +160,8 @@ extern "C" {
                 try {
                     PubKey k = PubKeyParser::Parse(entry.pubKeyBytes);
                     int gId = 0;
-                    try {
-                        gId = std::stoi(entry.groupId);
-                    }
-                    catch (...) {
-                        gId = 0;
-                    }
+                    try { gId = std::stoi(entry.groupId); }
+                    catch (...) { gId = 0; }
                     parsedEntries.push_back({ gId, std::move(k) });
                 }
                 catch (...) {
@@ -127,40 +169,71 @@ extern "C" {
                 }
             }
 
+            // Optional single-group fast path.
+            if (targetGroupId > 0) {
+                std::vector<ParsedEntry> only;
+                for (auto& pe : parsedEntries) {
+                    if (pe.groupId == targetGroupId) { only.push_back(std::move(pe)); break; }
+                }
+                parsedEntries.swap(only);
+            }
+
             if (parsedEntries.empty()) {
                 return false;
             }
 
-            // 5. Test pre-parsed candidate public keys concurrently using hardware threads[cite: 2]
-            std::atomic<bool> foundValid(false);
+            const bool singleGroup = (parsedEntries.size() == 1);
+
+            // Inner-MITM budget:
+            //   single group  -> let the ONE search grab every P-core (parallel)
+            //   many groups    -> force each search serial; throughput comes from
+            //                     running many groups at once (no nested spawn).
+            H1Search::FreeSlots.store(singleGroup ? H1Search::TotalSlots() : 0,
+                                      std::memory_order_relaxed);
+
+            std::atomic<bool>   foundValid(false);
+            std::atomic<size_t> nextIdx(0);
             int resolvedGroupId = 0;
             std::vector<unsigned char> resolvedUid;
 
-            unsigned int numThreads = std::thread::hardware_concurrency();
-            if (numThreads == 0) numThreads = 4;
-
-            // v2: on a hybrid CPU, run the outer entry loop on P-cores only so
-            // it doesn't contend with the inner MITM's P-core threads and so
-            // no entry lands on a slow E-core. Falls back to all logical cores
-            // on non-hybrid CPUs.
-            std::vector<DWORD_PTR> pCoreMasks = GetPerformanceCoreMasks();
-            if (!pCoreMasks.empty()) numThreads = (unsigned int)pCoreMasks.size();
-
-            size_t totalEntries = parsedEntries.size();
-            size_t chunkSize = (totalEntries + numThreads - 1) / numThreads;
+            // Worker set.
+            unsigned int numWorkers;
+#ifdef _WIN32
+            std::vector<DWORD_PTR> pinMasks;
+            if (!singleGroup) {
+                pinMasks = GetPerformanceThreadMasks();          // 16 on 13700KF
+                if (pinMasks.empty()) {                          // non-hybrid fallback
+                    unsigned int hc = std::thread::hardware_concurrency();
+                    if (hc == 0) hc = 4;
+                    for (unsigned int i = 0; i < hc && i < 64; ++i)
+                        pinMasks.push_back((DWORD_PTR)1 << i);
+                }
+                numWorkers = (unsigned int)pinMasks.size();
+            } else {
+                numWorkers = 1;                                  // inner MITM is the parallel one
+            }
+#else
+            numWorkers = singleGroup ? 1u
+                                     : (std::max)(1u, std::thread::hardware_concurrency());
+#endif
+            if (numWorkers > (unsigned int)parsedEntries.size())
+                numWorkers = (unsigned int)parsedEntries.size();
 
             std::vector<std::thread> workers;
-            workers.reserve(numThreads);
+            workers.reserve(numWorkers);
 
-            for (unsigned int t = 0; t < numThreads; ++t) {
-                size_t startIdx = t * chunkSize;
-                size_t endIdx = (std::min)(startIdx + chunkSize, totalEntries);
-                if (startIdx >= endIdx) continue;
-
-                workers.emplace_back([&, t, startIdx, endIdx]() {
-                    PinToPerformanceCore(pCoreMasks, (size_t)t);
-                    for (size_t i = startIdx; i < endIdx; ++i) {
-                        if (foundValid.load()) break;
+            for (unsigned int t = 0; t < numWorkers; ++t) {
+                workers.emplace_back([&, t]() {
+#ifdef _WIN32
+                    if (!singleGroup && t < pinMasks.size()) {
+                        SetThreadAffinityMask(GetCurrentThread(), pinMasks[t]);
+                    }
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+                    for (;;) {
+                        if (foundValid.load(std::memory_order_relaxed)) break;
+                        size_t i = nextIdx.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= parsedEntries.size()) break;
 
                         const auto& entry = parsedEntries[i];
                         std::string actPkeyConfig;
@@ -171,8 +244,12 @@ extern "C" {
                         if (success) {
                             bool expected = false;
                             if (foundValid.compare_exchange_strong(expected, true)) {
+                                // Only the CAS winner writes these; safe without a lock.
                                 resolvedUid = uid;
                                 resolvedGroupId = entry.groupId;
+                                // Stop every other in-flight MITM at its next poll,
+                                // instead of grinding its full 2^18 scan to a miss.
+                                H1Search::Abort.store(1, std::memory_order_relaxed);
                             }
                             break;
                         }
@@ -180,11 +257,8 @@ extern "C" {
                     });
             }
 
-            // Wait for all worker threads to complete[cite: 2]
             for (auto& worker : workers) {
-                if (worker.joinable()) {
-                    worker.join();
-                }
+                if (worker.joinable()) worker.join();
             }
 
             if (foundValid.load()) {
@@ -195,14 +269,9 @@ extern "C" {
                     std::memset(outUid8Bytes, 0, 8);
                     std::memcpy(outUid8Bytes, resolvedUid.data(), resolvedUid.size());
                 }
-
-                if (outGroupId) {
-                    *outGroupId = resolvedGroupId;
-                }
-
+                if (outGroupId) *outGroupId = resolvedGroupId;
                 return true;
             }
-
             return false;
         }
         catch (...) {
@@ -210,7 +279,7 @@ extern "C" {
         }
     }
 
-    // Legacy File-Path variant (backward compatible wrapper around memory stream)[cite: 2, 7]
+    // Legacy File-Path variant -> scans all groups (targetGroupId = 0).
     DLL_EXPORT bool VerifyAndExtractKey(
         const char* cdKeyStr,
         const char* configFilePath,
@@ -224,14 +293,36 @@ extern "C" {
             std::stringstream buffer;
             buffer << file.rdbuf();
             std::string outerXml = buffer.str();
-            return VerifyKeyFromMemory(cdKeyStr, outerXml.data(), (int)outerXml.size(), outUid8Bytes, outGroupId);
+            return VerifyKeyFromMemory(cdKeyStr, outerXml.data(), (int)outerXml.size(), outUid8Bytes, outGroupId, 0);
         }
         catch (...) {
             return false;
         }
     }
 
-    // Raw variant: bypasses CD-key string parsing and .xrm-ms extraction entirely[cite: 2]
+    // Same as VerifyAndExtractKey but lets a caller pin a known group (warm path).
+    DLL_EXPORT bool VerifyAndExtractKeyG(
+        const char* cdKeyStr,
+        const char* configFilePath,
+        int targetGroupId,
+        unsigned char* outUid8Bytes,
+        int* outGroupId
+    ) {
+        try {
+            if (!configFilePath) return false;
+            std::ifstream file(configFilePath, std::ios::binary);
+            if (!file.is_open()) return false;
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            std::string outerXml = buffer.str();
+            return VerifyKeyFromMemory(cdKeyStr, outerXml.data(), (int)outerXml.size(), outUid8Bytes, outGroupId, targetGroupId);
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    // Raw variant: single pubkey, inner MITM fully parallel across P-cores.
     DLL_EXPORT bool VerifyRawKeyAgainstPubKey(
         const unsigned char* rawKey16,
         const unsigned char* pubKeyBytes,
@@ -246,6 +337,10 @@ extern "C" {
                 return false;
             }
 
+            // Single search -> reset abort, and let it take all P-cores.
+            H1Search::Abort.store(0, std::memory_order_relaxed);
+            H1Search::FreeSlots.store(H1Search::TotalSlots(), std::memory_order_relaxed);
+
             std::vector<unsigned char> bEncryptArray(rawKey16, rawKey16 + 16);
             std::vector<unsigned char> pubKey(pubKeyBytes, pubKeyBytes + pubKeyLen);
 
@@ -254,29 +349,20 @@ extern "C" {
             std::vector<unsigned char> uid;
 
             bool success = PKeyCalc::TryPubKey(pubKey, bEncryptArray, actPkeyConfig, h1Coeffs, uid);
-            if (!success) {
-                return false;
-            }
+            if (!success) return false;
 
-            if (uid.size() >= 8) {
-                std::memcpy(outUid8Bytes, uid.data(), 8);
-            }
-            else {
-                std::memset(outUid8Bytes, 0, 8);
-                std::memcpy(outUid8Bytes, uid.data(), uid.size());
-            }
+            if (uid.size() >= 8) std::memcpy(outUid8Bytes, uid.data(), 8);
+            else { std::memset(outUid8Bytes, 0, 8); std::memcpy(outUid8Bytes, uid.data(), uid.size()); }
 
             if (outH1Coeffs15) {
                 std::memset(outH1Coeffs15, 0, 15);
                 std::memcpy(outH1Coeffs15, h1Coeffs.data(), (std::min)((size_t)15, h1Coeffs.size()));
             }
-
             if (outActPkeyConfigB64 && outActPkeyConfigB64Len > 0) {
                 size_t copyLen = (std::min)((size_t)(outActPkeyConfigB64Len - 1), actPkeyConfig.size());
                 std::memcpy(outActPkeyConfigB64, actPkeyConfig.data(), copyLen);
                 outActPkeyConfigB64[copyLen] = '\0';
             }
-
             return true;
         }
         catch (...) {

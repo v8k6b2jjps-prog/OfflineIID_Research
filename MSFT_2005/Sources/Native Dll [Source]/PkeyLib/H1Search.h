@@ -26,30 +26,18 @@ public:
     inline static std::vector<DWORD_PTR> PCoreMasks = GetPerformanceCoreMasks();
 
     // ---- Shared global thread budget -------------------------------------
-    // The MITM (build + scan) is embarrassingly parallel and is 93% of the
-    // work, but Solve can be called concurrently from an outer pool (one per
-    // public-key entry). Rather than hardcode the inner layer to 1 thread
-    // (which strands the whole machine when validating a single key) or to
-    // hardware_concurrency (which oversubscribes when many entries run at
-    // once), threads are drawn from ONE global budget: total slots =
-    // hardware_concurrency. Each Solve with threads<=0 claims as many free
-    // slots as are available at entry (min 1), runs the MITM across them,
-    // and returns them. Single key in flight -> MITM gets all cores, exactly
-    // like the C# reference's nested Parallel.For. Many keys -> each stays
-    // small. Pass threads>0 to override with an explicit count.
+    // Drawn by Solve when threads<=0. The DLL entry points set this to
+    // TotalSlots() for a single-key search (inner MITM parallel) or to 0 for
+    // the many-groups scan (inner MITM serial; throughput comes from running
+    // many groups at once). See Export.cpp.
     inline static std::atomic<int> FreeSlots{ -1 };
 
     static int TotalSlots() {
-        // v2: on a hybrid CPU, the budget is the number of physical P-cores,
-        // so the MITM never spills onto E-cores. Falls back to logical-core
-        // count on non-hybrid / detection failure.
         if (!PCoreMasks.empty()) return (int)PCoreMasks.size();
         int hc = (std::max)(1, (int)std::thread::hardware_concurrency());
         return hc;
     }
 
-    // Claim up to `want` free slots (at least 1). Returns the number claimed;
-    // the caller MUST release exactly that many.
     static int ClaimSlots(int want) {
         int expected = FreeSlots.load(std::memory_order_relaxed);
         if (expected < 0) { // lazy init on first use
@@ -61,14 +49,12 @@ public:
             int avail = (std::max)(0, expected);
             int take = (std::min)(want, avail);
             if (take <= 1) {
-                // nothing free (or only ourselves) -> run serial, claim 0 extra
                 return 1;
             }
             if (FreeSlots.compare_exchange_weak(expected, expected - take,
                 std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 return take;
             }
-            // expected reloaded by compare_exchange_weak; retry
         }
     }
 
@@ -100,12 +86,6 @@ private:
         return v;
     }
 
-    // Split [0,total) into nth contiguous chunks and run `body(begin,end)` on
-    // each. When nth==1 the chunk runs inline on the CALLING thread with no
-    // std::thread created at all -- this matters because Solve is itself
-    // normally invoked from an outer thread pool (see Export.cpp), so the
-    // inner layer is deliberately serial and spawning+joining a thread just
-    // to run one chunk was pure overhead. Behaviour for nth>1 is unchanged.
     template <typename Body>
     static void RunChunks(int nth, int64_t total, Body body) {
         int nchunk = (std::max)(1, nth);
@@ -120,8 +100,6 @@ private:
             int64_t begin = (int64_t)c * chunk;
             int64_t end = (std::min)(begin + chunk, total);
             workers.emplace_back([&, c, begin, end]() {
-                // v2: pin this worker to P-core #c (identical cores => the equal
-                // [begin,end) split is now correctly balanced; no HT contention).
                 PinToPerformanceCore(PCoreMasks, (size_t)c);
                 body(begin, end);
             });
@@ -131,10 +109,11 @@ private:
 
 public:
     static std::vector<int> Solve(const std::vector<Fp6>& g, const Fp6& target, const std::vector<int>& lo, const std::vector<int>& hi, std::string& note, int threads = 0) {
-        Abort.store(0, std::memory_order_relaxed);
+        // NOTE: Abort is NOT reset here. Resetting per-Solve would let a
+        // late-starting search wipe out the abort signal a winning thread
+        // raised for its siblings. The DLL entry points reset it once, before
+        // any worker starts (see Export.cpp).
         int n = (int)lo.size();
-        // threads > 0 : explicit override. threads <= 0 : draw from the shared
-        // global budget so nested parallelism self-limits (see FreeSlots).
         int claimed = 1;
         int nth;
         if (threads > 0) {
@@ -191,7 +170,13 @@ public:
             rwrap[i] = Fp6mOp::PowBig(gimP[R0 + i], expVal);
         }
 
-        std::vector<uint64_t> keys(rsize);
+        // ---- Reused build-side key buffer (per calling thread) --------------
+        // Every slot [0,rsize) is overwritten by the build loop below, so no
+        // zero-fill is needed -- only a size guarantee. rsize is constant for
+        // all 2005 configs, so after the first Solve this never reallocates.
+        static thread_local std::vector<uint64_t> keysBuf;
+        if ((int64_t)keysBuf.size() < rsize) keysBuf.resize(rsize);
+        std::vector<uint64_t>& keys = keysBuf;
 
         RunChunks(nth, rsize, [&](int64_t begin, int64_t end) {
             if (begin >= end) return;
@@ -216,20 +201,46 @@ public:
             }
             });
 
+        // If a sibling search already won while we were building, bail before
+        // paying for the table build + full scan -- both are guaranteed waste.
+        if (Abort.load(std::memory_order_relaxed) != 0) { note = "aborted"; return {}; }
+
         // =========================================================================
-        // Flat Open-Addressing Hash Table with Linear Probing
+        // Flat open-addressing hash table with linear probing.
+        //
+        // Reused across calls on this thread via a per-call generation stamp:
+        // a slot is "occupied for THIS call" iff stampTbl[idx] == gen. That
+        // removes the 8 MB zero-fill that the previous (fresh) table paid on
+        // every single Solve -- at ~180 groups that was ~1.4 GB of memset
+        // traffic and 180 alloc/free cycles per validation.
+        //
+        // valTbl holds R-side indices, which are < rsize (<= 2^18), so int32
+        // is plenty and halves this buffer's footprint vs int64.
         // =========================================================================
         const size_t tableSize = 1 << 20;
         const size_t tableMask = tableSize - 1;
-        std::vector<int64_t> hashTable(tableSize, -1);
+
+        static thread_local std::vector<int32_t>  valTbl;
+        static thread_local std::vector<uint32_t> stampTbl;
+        static thread_local uint32_t gen = 0;
+        if (valTbl.size() != tableSize) {
+            valTbl.assign(tableSize, -1);
+            stampTbl.assign(tableSize, 0);
+            gen = 0;
+        }
+        if (++gen == 0) { // wrapped after 4 billion calls on this thread
+            std::fill(stampTbl.begin(), stampTbl.end(), 0u);
+            gen = 1;
+        }
 
         for (int64_t i = 0; i < rsize; i++) {
             uint32_t full_hash = (uint32_t)(keys[i] >> 32);
             size_t idx = full_hash & tableMask;
-            while (hashTable[idx] != -1) {
+            while (stampTbl[idx] == gen) {
                 idx = (idx + 1) & tableMask;
             }
-            hashTable[idx] = i;
+            stampTbl[idx] = gen;
+            valTbl[idx] = (int32_t)i;
         }
 
         const int L0 = 7, L1 = 13;
@@ -261,8 +272,8 @@ public:
             uint32_t fh = HashM(needed);
             size_t idx = fh & tableMask;
 
-            while (hashTable[idx] != -1) {
-                int64_t pp = hashTable[idx];
+            while (stampTbl[idx] == gen) {
+                int64_t pp = (int64_t)valTbl[idx];
                 if ((uint32_t)(keys[pp] >> 32) == fh) {
                     ProbeHashHits++;
                     int64_t rs = (int64_t)(uint32_t)keys[pp];
@@ -295,10 +306,6 @@ public:
             Fp6m la = Fp6mOp::Mul6(tgt, li0);
             Fp6m lb = Fp6mOp::Mul6(tgtI, li0);
 
-            // Reused across the whole scan: probe() only writes into this
-            // on an actual hit (roughly once in the entire run), so a
-            // single instance is behavior-identical to a fresh vector per
-            // iteration -- but avoids ~2^19 heap allocations per worker.
             std::vector<int> tempSol;
 
             for (int64_t s = begin; s < end; s++) {
