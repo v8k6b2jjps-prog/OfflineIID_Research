@@ -2,7 +2,10 @@
 #include "BigInteger.h"
 #include <vector>
 #include <mutex>
+
+#if defined(_M_IX86) || defined(_M_X64)
 #include <immintrin.h>
+#endif
 
 #include "mini-gmp.h"
 // #include <gmp.h>
