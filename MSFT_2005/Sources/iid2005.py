@@ -138,9 +138,9 @@ if __name__ == '__main__':
     sp = p.add_subparsers(title='Commands', dest='mode')
     enc_p = sp.add_parser('encode')
     enc_p.add_argument('hwid',     type=lambda i: int(i,0), help='Hardware ID')
+    enc_p.add_argument('security', type=lambda i: int(i,0), help='Security value')
     enc_p.add_argument('group',    type=lambda i: int(i,0), help='Group reference ID')
     enc_p.add_argument('serial',   type=lambda i: int(i,0), help='Serial number')
-    enc_p.add_argument('security', type=lambda i: int(i,0), help='Security value')
     enc_p.add_argument('-u',       type=lambda i: int(i,0), help='Upgrade bit', dest='upgrade', default=0)
 
     dec_p = sp.add_parser('decode')
@@ -165,7 +165,7 @@ if __name__ == '__main__':
             print('Upgrade  : [0x%01x]\n' % upgrade)
 
         case 'encode':
-            iid = encode_iid(arg.hwid, arg.group, arg.serial, arg.security, arg.upgrade)
+            iid = encode_iid(arg.hwid, arg.security, arg.group, arg.serial, arg.upgrade)
             print(iid)
 
         case _:
