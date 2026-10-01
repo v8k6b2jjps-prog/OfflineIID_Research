@@ -4,100 +4,145 @@ using namespace System.Diagnostics
 
 Clear-Host
 
+# ------------------------------------------------------------
+# Process priority
+# ------------------------------------------------------------
+
+Set-Location $PSScriptRoot
+$CurrentProcess = [Process]::GetCurrentProcess()
+
+try {
+    $CurrentProcess.PriorityClass = [ProcessPriorityClass]::High
+    [Threading.Thread]::CurrentThread.Priority =
+        [Threading.ThreadPriority]::Highest
+}
+catch {
+    # Priority changes are optional; continue if unavailable.
+}
+
+# ------------------------------------------------------------
+# Native P/Invoke
+# ------------------------------------------------------------
+
+$DllPath = Join-Path $PSScriptRoot "PkeyLib.dll"
+$DllPathForCSharp = $DllPath.Replace('\', '\\').Replace('"', '\"')
+
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 
-public static class Native {
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr LoadLibrary(string path);
-
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetProcAddress(IntPtr module, string name);
-
-    [DllImport("kernel32.dll")]
-    public static extern bool FreeLibrary(IntPtr module);
+public static class PkeyNative
+{
+    [DllImport(
+        "$DllPathForCSharp",
+        EntryPoint = "VerifyAndExtractKeyByRef",
+        CallingConvention = CallingConvention.Cdecl,
+        ExactSpelling = true,
+        SetLastError = false)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool VerifyAndExtractKeyByRef(
+        [MarshalAs(UnmanagedType.LPStr)] string key,
+        [MarshalAs(UnmanagedType.LPStr)] string config,
+        [Out] byte[] uid,
+        out int group);
 }
-
-[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-public delegate bool VerifyAndExtractKeyDelegate(
-    IntPtr key, IntPtr config, IntPtr uid, IntPtr group);
 "@
 
-$CdKey = "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289"
-$Config = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
-if (-not (Test-Path $Config)) {
-    Write-Host "[-] Config not found: $Config" -ForegroundColor Red
-    return
-}
+$CdKey = "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289"
+
+$Config = Join-Path `
+    $PSScriptRoot `
+    "pkeyconfig.xrm-ms"
 
 $DllFile = "PkeyLib.dll"
 $DllPath = Join-Path $PSScriptRoot $DllFile
 
 Write-Host "`n=== $DllFile ===" -ForegroundColor Cyan
 
-if (-not (Test-Path $DllPath)) {
-	Write-Host "[-] DLL not found" -ForegroundColor Red
-	continue
+if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
+    Write-Host "[-] Config not found: $Config" -ForegroundColor Red
+    return
 }
 
-$hDll = [Native]::LoadLibrary($DllPath)
-
-if (!$hDll) {
-	Write-Host "[-] LoadLibrary failed" -ForegroundColor Red
-	continue
+if (-not (Test-Path -LiteralPath $DllPath -PathType Leaf)) {
+    Write-Host "[-] DLL not found: $DllPath" -ForegroundColor Red
+    return
 }
 
-try {
-	$fn = [Native]::GetProcAddress($hDll, "VerifyAndExtractKey")
+# ------------------------------------------------------------
+# Make the DLL discoverable by the loader
+# ------------------------------------------------------------
 
-	if (!$fn) {
-		Write-Host "[-] Function not found" -ForegroundColor Red
-		continue
-	}
+$group = 0
+$uidBytes = [byte[]]::new(8)
 
-	$Verify = [Marshal]::GetDelegateForFunctionPointer(
-		$fn, [VerifyAndExtractKeyDelegate])
+$sw = [Stopwatch]::StartNew()
+$success = [PkeyNative]::VerifyAndExtractKeyByRef(
+    $CdKey,
+    $Config,
+    $uidBytes,
+    [ref]$group
+)
+$sw.Stop()
 
-	$cKey = [Marshal]::StringToHGlobalAnsi($CdKey)
-	$cCfg = [Marshal]::StringToHGlobalAnsi($Config)
-	$uBuf = [Marshal]::AllocHGlobal(8)
-	$gPtr = [Marshal]::AllocHGlobal(4)
+if ($success) {
 
-	try {
-		$sw = [Stopwatch]::StartNew()
+    <#
+    https://github.com/UMSKT/writeups/blob/main/PKEY2005.md
+    struct DECODED_PKEY {
+        bool upgrade : 1; // presumed to indicate upgrade keys
+        uint pid : 30; // middle 9 digits of Product ID
+        uint auth : 10; // presumed to be authentication bits
+    }
+    #>
 
-		$success = $Verify.Invoke($cKey, $cCfg, $uBuf, $gPtr)
+    $GetBits = {
+        param (
+            [Parameter(Mandatory = $true, Position = 0)]
+            [byte[]]$Bytes,
 
-		$sw.Stop()
+            [Parameter(Mandatory = $true, Position = 1)]
+            [ValidateRange(0, 63)]
+            [int]$StartBit,
 
-		if ($success) {
-			$bytes = [byte[]]::new(8)
-			[Marshal]::Copy($uBuf, $bytes, 0, 8)
+            [Parameter(Mandatory = $true, Position = 2)]
+            [ValidateRange(1, 64)]
+            [int]$BitCount
+        )
 
-			$uid = [BitConverter]::ToUInt64($bytes, 0)
-			$group = [Marshal]::ReadInt32($gPtr)
-			$hex = -join ($bytes | ForEach-Object { $_.ToString("X2") })
+        [UInt64]$Value = 0
+        $byteCount = [Math]::Min($Bytes.Length, 8)
 
-			write-host
-			Write-Host "Time     : $($sw.Elapsed.TotalSeconds)s"
-			Write-Host "Upgrade  : $([int](($uid -band 1) -eq 1))"
-			Write-Host "Serial   : $(($uid -shr 1) -band 0x3FFFFFFF)"
-			Write-Host "Auth     : $(($uid -shr 31) -band 0x3FF)"
-			Write-Host "Group    : $group"
-		}
-		else {
-			Write-Host "[ X ] Invalid" -ForegroundColor DarkGray
-		}
-	}
-	finally {
-		[Marshal]::FreeHGlobal($cKey)
-		[Marshal]::FreeHGlobal($cCfg)
-		[Marshal]::FreeHGlobal($uBuf)
-		[Marshal]::FreeHGlobal($gPtr)
-	}
+        for ($i = 0; $i -lt $byteCount; $i++) {
+            $Value = $Value -bor ([UInt64]$Bytes[$i] -shl ($i * 8))
+        }
+
+        [UInt64]$Mask = if ($BitCount -eq 64) { 
+            [UInt64]::MaxValue 
+        } else { 
+            ([UInt64]1 -shl $BitCount) - 1 
+        }
+
+        return (($Value -shr $StartBit) -band $Mask)
+    }
+
+    $Upgrade = & $GetBits $uidBytes 00 01
+    $Serial  = & $GetBits $uidBytes 01 30
+    $Auth    = & $GetBits $uidBytes 31 10
+
+    Write-Host
+    Write-Host "Time     : $($sw.Elapsed.TotalSeconds.ToString('F7'))s"
+    Write-Host "Upgrade  : $Upgrade"
+    Write-Host "Serial   : $Serial"
+    Write-Host "Auth     : $Auth"
+    Write-Host "Group    : $group"
+
 }
-finally {
-	[Native]::FreeLibrary($hDll) | Out-Null
+else {
+    Write-Host
+    Write-Host "[ X ] Invalid" -ForegroundColor DarkGray
 }
