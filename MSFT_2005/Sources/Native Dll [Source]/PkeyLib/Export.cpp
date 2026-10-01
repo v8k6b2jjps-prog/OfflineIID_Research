@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <thread>
 #include <atomic>
+#include <Windows.h>
+#include <objbase.h>
 
 #ifdef _WIN32
 #define DLL_EXPORT __declspec(dllexport)
@@ -294,6 +296,59 @@ extern "C" {
             buffer << file.rdbuf();
             std::string outerXml = buffer.str();
             return VerifyKeyFromMemory(cdKeyStr, outerXml.data(), (int)outerXml.size(), outUid8Bytes, outGroupId, 0);
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    DLL_EXPORT bool VerifyAndExtractKeyByRef(
+        const char* cdKeyStr,
+        const char* configFilePath,
+        unsigned char* outUid8Bytes,
+        int* outGroupId
+    )
+    {
+        try {
+            if (!cdKeyStr ||
+                !configFilePath ||
+                !outUid8Bytes ||
+                !outGroupId) {
+                return false;
+            }
+
+            *outGroupId = 0;
+
+            std::ifstream file(configFilePath, std::ios::binary);
+            if (!file.is_open()) {
+                return false;
+            }
+
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+
+            std::string outerXml = buffer.str();
+
+            unsigned char uid[8] = {};
+            int groupId = 0;
+
+            const bool success = VerifyKeyFromMemory(
+                cdKeyStr,
+                outerXml.data(),
+                static_cast<int>(outerXml.size()),
+                uid,
+                &groupId,
+                0
+            );
+
+            if (!success) {
+                return false;
+            }
+
+            std::memcpy(outUid8Bytes, uid, 8);
+            *outGroupId = groupId;
+
+            return true;
         }
         catch (...) {
             return false;
