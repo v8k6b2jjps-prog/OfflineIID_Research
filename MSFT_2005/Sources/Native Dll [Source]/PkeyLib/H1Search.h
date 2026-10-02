@@ -114,6 +114,12 @@ public:
         // raised for its siblings. The DLL entry points reset it once, before
         // any worker starts (see Export.cpp).
         int n = (int)lo.size();
+        // 'order' below and the R/L split are hard-wired for 14 bases. Anything
+        // else would index out of bounds, so refuse instead of corrupting memory.
+        if (n != 14 || (int)hi.size() != n || (int)g.size() != n) {
+            note = "unsupported key shape";
+            return {};
+        }
         int claimed = 1;
         int nth;
         if (threads > 0) {
@@ -262,21 +268,37 @@ public:
         Fp6 tgtI_fp6 = Fp6::One() / target;
         Fp6m tgtI = Fp6m::FromFp6(tgtI_fp6);
 
+        // ---- FIX: snapshot the per-thread buffers for the workers ----------
+        // valTbl / stampTbl / gen are thread_local (function-static), and such
+        // variables are NOT captured by a lambda: naming them inside 'probe'
+        // resolves to the instance of whichever thread RUNS the lambda. On a
+        // RunChunks worker thread those instances are empty vectors (and
+        // gen == 0), so 'stampTbl[idx]' read through a null pointer -> access
+        // violation -> host process dies. It only showed up when nth > 1,
+        // i.e. single-group configs / targetGroupId / the raw entry point.
+        // Plain locals ARE captured (which is why 'keys', a local reference,
+        // already worked), so take the calling thread's pointers here and use
+        // only these from inside the lambdas.
+        const uint32_t* const stampP = stampTbl.data();
+        const int32_t*  const valP   = valTbl.data();
+        const uint64_t* const keysP  = keys.data();
+        const uint32_t        genL   = gen;
+
         std::string hitNote = "";
         std::vector<int> hitSol;
         bool found = false;
-        int stopFlag = 0;
+        std::atomic<int> stopFlag{ 0 }; // was a plain int written by several threads
 
         auto probe = [&](const Fp6m& needed, int64_t s, std::vector<int>& solutionOut) -> bool {
             ProbeCalls++;
             uint32_t fh = HashM(needed);
             size_t idx = fh & tableMask;
 
-            while (stampTbl[idx] == gen) {
-                int64_t pp = (int64_t)valTbl[idx];
-                if ((uint32_t)(keys[pp] >> 32) == fh) {
+            while (stampP[idx] == genL) {
+                int64_t pp = (int64_t)valP[idx];
+                if ((uint32_t)(keysP[pp] >> 32) == fh) {
                     ProbeHashHits++;
-                    int64_t rs = (int64_t)(uint32_t)keys[pp];
+                    int64_t rs = (int64_t)(uint32_t)keysP[pp];
                     int rd[16];
                     Fp6m rv = ProdM(gmP, loP, hiP, R0, R1, rs, rd);
                     if (rv.Eq(needed)) {
@@ -310,15 +332,16 @@ public:
 
             for (int64_t s = begin; s < end; s++) {
                 if ((s & 0x3FF) == 0 && Abort.load(std::memory_order_relaxed) != 0) return;
-                if (stopFlag != 0) return;
+                if (stopFlag.load(std::memory_order_relaxed) != 0) return;
 
                 bool matched = false;
                 if (probe(la, s, tempSol)) matched = true;
                 else if (probe(lb, s, tempSol)) matched = true;
 
                 if (matched) {
-                    if (stopFlag == 0) {
-                        stopFlag = 1;
+                    // CAS: exactly one worker may write hitSol/hitNote/found.
+                    int expectedStop = 0;
+                    if (stopFlag.compare_exchange_strong(expectedStop, 1)) {
                         hitSol = tempSol;
                         hitNote = "左半 #" + std::to_string(s) + " 命中右半（并行块 " + std::to_string(ci) + "）";
                         found = true;
