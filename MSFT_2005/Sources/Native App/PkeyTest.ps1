@@ -4,6 +4,7 @@ using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
 
 # Source I use
+# TSForge project, ExtPid
 # laomms, PKey2005Decoder, C# Source
 # massgravel, spp-stuff-main, iid2005.py
 # https://github.com/ntriver-org/PKeyMaster/commit/4926123bc7e56882dc13123942c3459728fb562c
@@ -35,6 +36,9 @@ using System.Runtime.InteropServices;
 
 public static class PkeyNative
 {
+    [DllImport("kernel32.dll")]
+    public static extern ushort GetSystemDefaultLangID();
+
     [DllImport(
         "PkeyLib.dll",
         EntryPoint = "VerifyAndExtractKeyByRef",
@@ -112,6 +116,62 @@ function Get-PkeyInfo {
     if ($iid) { $h = Get-IidHwid $iid; if ($h) { $hwid = $h } }
     $offlineAct = New-Iid2005 -Hwid $hwid -Security $auth -Group $Group -Serial $serial -Upgrade $upgrade
 
+# Tsforge Project
+$GetPid = {
+    param (
+        [long]$Serial,
+        [int]$Group,
+        [string]$EulaType = "Retail",
+        [string]$Mpc = "00000"
+    )
+
+    $groupPart = ($Group -shr 1) % 100
+    $high      = [int]([Math]::Floor($Serial / 1000000) % 1000)   # clamped like the real code
+    $low       = [int]($Serial % 1000000)
+
+    if ($EulaType -like 'OEM*') {
+        $serialHigh = 'OEM'
+        $serialLow  = [int]([Math]::Floor($low / 100000) + 10 * ($high + 1000 * $groupPart))
+        $lastPart   = [int]($Serial % 100000)
+    }
+    else {
+        $serialHigh = '{0:D3}' -f $high
+        $serialLow  = $low
+        $lastPart   = [int]($groupPart * 1000 + (Get-Random -Maximum 1000))
+    }
+
+    # Digit sum of serialLow, mod-7 check digit (1..7, never 0)
+    $sum = 0
+    foreach ($ch in $serialLow.ToString().ToCharArray()) { $sum += [int]$ch - 48 }
+    $checksum = 7 - ($sum % 7)
+
+    '{0}-{1}-{2:D6}{3}-{4:D5}' -f $Mpc, $serialHigh, $serialLow, $checksum, $lastPart
+}
+$GetExtendedPid = {
+    param (
+        [long]$Serial,
+        [int]$Group,
+        [string]$EulaType = "Retail",
+        [string]$Mpc = "00000"
+    )
+
+    $now = Get-Date
+    $licenseType = switch -Wildcard ($EulaType) { 'OEM*' { 2 } 'Volume*' { 3 } default { 0 } }
+
+    [String]::Format(
+        "{0}-{1:D5}-{2:D3}-{3:D6}-{4:D2}-{5:D4}-{6:D4}.0000-{7:D3}{8:D4}",
+        $Mpc,
+        $Group % 100000,
+        [int]([Math]::Floor($Serial / 1000000) % 1000),
+        [int]($Serial % 1000000),
+        $licenseType,
+        [PkeyNative]::GetSystemDefaultLangID(),
+        [Environment]::OSVersion.Version.Build,
+        $now.DayOfYear,
+        $now.Year
+    )
+}
+
     [pscustomobject]@{
         Upgrade     = $upgrade
         Serial      = $serial
@@ -124,6 +184,8 @@ function Get-PkeyInfo {
         EulaType    = if ($range) { & $get $range 'EulaType' } else { $null }
         RangeValid  = if ($range) { (& $get $range 'IsValid') -eq 'true' } else { $null }
         ActString   = $actString
+        BasePid     = & $GetPid -Serial $serial -Group $Group -EulaType $eula
+        ExtendedPID = & $GetExtendedPid -Serial $serial -Group $Group
         HWID        = $hwid
         OfflineAct  = $offlineAct
     }
@@ -479,7 +541,6 @@ $success = [PkeyNative]::VerifyAndExtractKeyByRef(
     [ref]$group
 )
 if ($success) {
-    Write-Host
     Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath $Config | Format-List
 } else {
     Write-Host "`n[ X ] Invalid" -ForegroundColor DarkGray
