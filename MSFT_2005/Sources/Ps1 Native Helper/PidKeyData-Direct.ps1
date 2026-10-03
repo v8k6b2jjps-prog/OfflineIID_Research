@@ -15,8 +15,6 @@ if (-not $BinkFile -or -not $KeyFile) {
 if ((!(Test-Path $BinkFile)) -or (!(Test-Path $KeyFile)) ) {
   throw "Error parse the files"
 }
-if (-not [Console]::IsOutputRedirected) { Clear-Host }
-
 if ([Environment]::Is64BitProcess) {
     $ps32 = "$($env:Windir)\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
     $fwd = @('-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-FromParent')
