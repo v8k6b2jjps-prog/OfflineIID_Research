@@ -39,7 +39,7 @@
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{b44a8cce-74d1-43ea-aa0b-1bdb0f521f18}</ProjectGuid>
     <RootNamespace>PkeyLib</RootNamespace>
-    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <!-- Shared by ALL configurations (taken from Release|x64) -->
@@ -136,10 +136,8 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="PCoreAffinity.h" />
     <ClInclude Include="TatePairing.h" />
+    <ClInclude Include="pKeyCalc.h" />
     <ClCompile Include="mini-gmp.cpp" />
-    <ClCompile Include="pKeyCalc.h" />
-  </ItemGroup>
-  <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="Export.cpp" />
     <ClCompile Include="pch.cpp" />

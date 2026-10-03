@@ -1,0 +1,2 @@
+Make Sure to install, MSVC v143, For Arm x64
+TO Compile to arm x64 Too

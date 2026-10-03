@@ -42,6 +42,9 @@
     <ClInclude Include="PCoreAffinity.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="pKeyCalc.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -49,9 +52,6 @@
     </ClCompile>
     <ClCompile Include="pch.cpp">
       <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="pKeyCalc.h">
-      <Filter>Header Files</Filter>
     </ClCompile>
     <ClCompile Include="Export.cpp">
       <Filter>Source Files</Filter>

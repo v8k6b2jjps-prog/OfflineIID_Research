@@ -2,18 +2,26 @@
 #include <iomanip>
 #include <fstream>
 #include <vector>
+#include <string>
+#include <algorithm>
+#include <filesystem>
 #include <cstring>
 #include <cstdint>
 #include <chrono>
 
-// Import the functions exported by your DLL (including the new Ex variant with 'fast')
+namespace fs = std::filesystem;
+
+// Matches the Export.cpp you sent: 6 parameters, last one is targetGroupId.
+// If your DLL build really exports the 5-parameter version, remove the last
+// parameter here and the ", 0" in the call below.
 extern "C" {
     __declspec(dllimport) bool VerifyKeyFromMemory(
         const char* cdKeyStr,
         const char* configXmlData,
         int configXmlLen,
         unsigned char* outUid8Bytes,
-        int* outGroupId
+        int* outGroupId,
+        int targetGroupId
     );
 }
 
@@ -22,11 +30,11 @@ static void PrintHex(const unsigned char* data, size_t len, const char* label) {
     for (size_t i = 0; i < len; i++) {
         std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)data[i];
     }
-    std::cout << std::dec << "\n";
+    std::cout << std::dec << std::setfill(' ') << "\n";
 }
 
 // Loads a raw file into memory (Zero Disk I/O stream helper)
-static bool LoadRawFile(const char* path, std::vector<unsigned char>& out) {
+static bool LoadRawFile(const fs::path& path, std::vector<unsigned char>& out) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) return false;
     std::streamsize size = f.tellg();
@@ -37,61 +45,93 @@ static bool LoadRawFile(const char* path, std::vector<unsigned char>& out) {
 
 int main() {
     const char* testCdKey = "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289";
-    const char* configFile = "C:\\Users\\Administrator\\Desktop\\pkeyconfig.xrm-ms";
+    const char* configRoot = "C:\\Windows\\Temp\\pkeyconfigs";
 
-    std::cout << "=== Native PKey Test Harness ===\n";
+    std::cout << "=== Native PKey Test Harness (all configs) ===\n";
     std::cout << "Key: " << testCdKey << "\n";
-    std::cout << "Config Path: " << configFile << "\n\n";
+    std::cout << "Config Root: " << configRoot << "\n\n";
 
-    // 1. Load config file into memory buffer first (Zero Disk I/O pipeline)
-    std::vector<unsigned char> xmlBuffer;
-    if (!LoadRawFile(configFile, xmlBuffer)) {
-        std::cout << "[ERROR] Failed to load config file into memory.\n";
+    // Collect every *.xrm-ms under the root, recursively
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(configRoot, fs::directory_options::skip_permission_denied, ec), end;
+        !ec && it != end; it.increment(ec)) {
+        std::error_code ec2;
+        if (!it->is_regular_file(ec2)) continue;
+        std::string ext = it->path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)::tolower(c); });
+        if (ext == ".xrm-ms") files.push_back(it->path());
+    }
+    std::sort(files.begin(), files.end());
+
+    if (files.empty()) {
+        std::cout << "[ERROR] No .xrm-ms files found.\n";
         return 1;
     }
+    std::cout << files.size() << " config file(s) found.\n";
 
-    unsigned char uid[8] = { 0 };
-    int groupId = 0;
+    int validCount = 0, invalidCount = 0, loadFailCount = 0;
 
-    std::cout << "Testing CD-Key verification via DLL (Memory stream with fast hint = true)...\n";
+    for (size_t i = 0; i < files.size(); i++) {
+        // Printed and flushed BEFORE the call: if the DLL crashes, the last
+        // line on screen is the file that did it.
+        std::cout << "\n[" << (i + 1) << "/" << files.size() << "] " << files[i].string() << std::endl;
 
-    auto startTime = std::chrono::high_resolution_clock::now();
+        std::vector<unsigned char> xmlBuffer;
+        if (!LoadRawFile(files[i], xmlBuffer)) {
+            std::cout << "  [ERROR] Failed to load config file into memory.\n";
+            loadFailCount++;
+            continue;
+        }
 
-    // Call the new extended function with fast = true
-    bool success = VerifyKeyFromMemory(
-        testCdKey,
-        reinterpret_cast<const char*>(xmlBuffer.data()),
-        (int)xmlBuffer.size(),
-        uid,
-        &groupId
-    );
+        unsigned char uid[8] = { 0 };
+        int groupId = 0;
 
-    auto endTime = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = endTime - startTime;
+        auto startTime = std::chrono::high_resolution_clock::now();
 
-    if (success) {
-        uint64_t rawUniqueId = 0;
-        std::memcpy(&rawUniqueId, uid, 8);
+        bool success = VerifyKeyFromMemory(
+            testCdKey,
+            reinterpret_cast<const char*>(xmlBuffer.data()),
+            (int)xmlBuffer.size(),
+            uid,
+            &groupId,
+            0   // scan every group in the file
+        );
 
-        bool upgradeFlag = (rawUniqueId & 0x1) == 1;
-        uint32_t pid = (uint32_t)((rawUniqueId >> 1) & 0x3FFFFFFF);
-        uint32_t auth = (uint32_t)((rawUniqueId >> 31) & 0x3FF);
+        auto endTime = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = endTime - startTime;
 
-        std::cout << "\n=== Validation Successful ===\n";
-        std::cout << "Status        : Valid Key\n";
-        std::cout << "Upgrade Flag : " << (upgradeFlag ? 1 : 0) << "\n";
-        std::cout << "Serial (PID) : " << pid << " (0x" << std::hex << pid << std::dec << ")\n";
-        std::cout << "Auth / SecID : " << auth << " (0x" << std::hex << auth << std::dec << ")\n";
-        std::cout << "Group ID     : " << groupId << "\n";
-        std::cout << "Key ID       : " << pid << "\n";
-        PrintHex(uid, 8, "UID Bytes");
-        std::cout << "Elapsed Time : " << std::fixed << std::setprecision(2) << elapsed.count() << "s\n";
+        if (success) {
+            validCount++;
+            uint64_t rawUniqueId = 0;
+            std::memcpy(&rawUniqueId, uid, 8);
+
+            bool upgradeFlag = (rawUniqueId & 0x1) == 1;
+            uint32_t pid = (uint32_t)((rawUniqueId >> 1) & 0x3FFFFFFF);
+            uint32_t auth = (uint32_t)((rawUniqueId >> 31) & 0x3FF);
+
+            std::cout << "  Status       : Valid Key\n";
+            std::cout << "  Upgrade Flag : " << (upgradeFlag ? 1 : 0) << "\n";
+            std::cout << "  Serial (PID) : " << pid << " (0x" << std::hex << pid << std::dec << ")\n";
+            std::cout << "  Auth / SecID : " << auth << " (0x" << std::hex << auth << std::dec << ")\n";
+            std::cout << "  Group ID     : " << groupId << "\n";
+            std::cout << "  ";
+            PrintHex(uid, 8, "UID Bytes   ");
+        }
+        else {
+            invalidCount++;
+            std::cout << "  Status       : Invalid Key\n";
+        }
+        std::cout << "  Elapsed Time : " << std::fixed << std::setprecision(2) << elapsed.count() << "s" << std::endl;
+        std::cout.unsetf(std::ios::floatfield);
+        // No break: keep going even after a success.
     }
-    else {
-        std::cout << "\nStatus        : Invalid Key (Signature mismatch across public key groups)\n";
-        std::cout << "[FAILED] Full pipeline verification failed.\n";
-        std::cout << "Elapsed Time : " << std::fixed << std::setprecision(2) << elapsed.count() << "s\n";
-    }
+
+    std::cout << "\n=== Done, no crash ===\n";
+    std::cout << "Files tested : " << files.size() << "\n";
+    std::cout << "Valid        : " << validCount << "\n";
+    std::cout << "Invalid      : " << invalidCount << "\n";
+    std::cout << "Load failed  : " << loadFailCount << "\n";
 
     std::cout << "\nPress any key to exit...";
     std::cin.get();
