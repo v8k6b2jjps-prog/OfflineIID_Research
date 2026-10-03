@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>PKeyValidator</AssemblyName>
+    <!-- PidKeyData.dll is a 32-bit DLL, so the process has to be 32-bit too -->
+    <PlatformTarget>x86</PlatformTarget>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="PidKeyData.dll" LogicalName="PidKeyData.dll" />
+  </ItemGroup>
+
+</Project>
