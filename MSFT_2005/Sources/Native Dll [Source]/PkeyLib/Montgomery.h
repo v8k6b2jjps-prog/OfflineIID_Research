@@ -236,35 +236,35 @@ public:
     // against a plain BigInteger modmul across 30,000+ random trials.
     FORCE_INLINE static Fpx Mul(const Fpx& a, const Fpx& b) {
         uint64_t T0 = 0, T1 = 0, T2 = 0, T3 = 0;
-        uint64_t bd[2] = { b.A0, b.A1 };
 
-        for (int i = 0; i < 2; i++) {
-            uint64_t bx = bd[i];
+        // --- Iteration 0 (bx = b.A0) ---
+        {
+            uint64_t bx = b.A0;
+            uint64_t hi0, lo0 = _umul128(a.A0, bx, &hi0);
+            uint64_t hi1, lo1 = _umul128(a.A1, bx, &hi1);
 
-            uint64_t hi0, hi1;
-            uint64_t lo0 = MulWide64(a.A0, bx, hi0);
-            uint64_t lo1 = MulWide64(a.A1, bx, hi1);
-            uint64_t P0 = lo0, P1, P2;
-            unsigned char pc = Adc64(0, hi0, lo1, P1);
-            P2 = hi1 + pc; // safe: hi1 <= 2^64-2 for any 64x64 product
+            uint64_t P0 = lo0, P1 = 0, P2 = 0;
+            unsigned char c0 = 0;
+            unsigned char pc = Adc64(c0, hi0, lo1, P1);
+            P2 = hi1 + pc;
 
-            unsigned char cc;
-            cc = Adc64(0, T0, P0, T0);
+            unsigned char cc = 0;
+            cc = Adc64(cc, T0, P0, T0);
             cc = Adc64(cc, T1, P1, T1);
             cc = Adc64(cc, T2, P2, T2);
             T3 += cc;
 
             uint64_t m = T0 * N0INV;
 
-            uint64_t qhi0, qhi1;
-            uint64_t qlo0 = MulWide64(m, PB0_, qhi0);
-            uint64_t qlo1 = MulWide64(m, PB1_, qhi1);
-            uint64_t Q0 = qlo0, Q1, Q2;
-            unsigned char qc = Adc64(0, qhi0, qlo1, Q1);
+            uint64_t qhi0, qlo0 = _umul128(m, PB0_, &qhi0);
+            uint64_t qhi1, qlo1 = _umul128(m, PB1_, &qhi1);
+            uint64_t Q0 = qlo0, Q1 = 0, Q2 = 0;
+            unsigned char qc0 = 0;
+            unsigned char qc = Adc64(qc0, qhi0, qlo1, Q1);
             Q2 = qhi1 + qc;
 
-            unsigned char dc;
-            dc = Adc64(0, T0, Q0, T0); // T0 becomes 0 here by construction of m
+            unsigned char dc = 0;
+            dc = Adc64(dc, T0, Q0, T0); // T0 becomes 0 here
             dc = Adc64(dc, T1, Q1, T1);
             dc = Adc64(dc, T2, Q2, T2);
             T3 += dc;
@@ -272,12 +272,50 @@ public:
             T0 = T1; T1 = T2; T2 = T3; T3 = 0;
         }
 
+        // --- Iteration 1 (bx = b.A1) ---
+        {
+            uint64_t bx = b.A1;
+            uint64_t hi0, lo0 = _umul128(a.A0, bx, &hi0);
+            uint64_t hi1, lo1 = _umul128(a.A1, bx, &hi1);
+
+            uint64_t P0 = lo0, P1 = 0, P2 = 0;
+            unsigned char c0 = 0;
+            unsigned char pc = Adc64(c0, hi0, lo1, P1);
+            P2 = hi1 + pc;
+
+            unsigned char cc = 0;
+            cc = Adc64(cc, T0, P0, T0);
+            cc = Adc64(cc, T1, P1, T1);
+            cc = Adc64(cc, T2, P2, T2);
+            T3 += cc;
+
+            uint64_t m = T0 * N0INV;
+
+            uint64_t qhi0, qlo0 = _umul128(m, PB0_, &qhi0);
+            uint64_t qhi1, qlo1 = _umul128(m, PB1_, &qhi1);
+            uint64_t Q0 = qlo0, Q1 = 0, Q2 = 0;
+            unsigned char qc0 = 0;
+            unsigned char qc = Adc64(qc0, qhi0, qlo1, Q1);
+            Q2 = qhi1 + qc;
+
+            unsigned char dc = 0;
+            dc = Adc64(dc, T0, Q0, T0);
+            dc = Adc64(dc, T1, Q1, T1);
+            dc = Adc64(dc, T2, Q2, T2);
+            T3 += dc;
+
+            T0 = T1; T1 = T2; T2 = T3; T3 = 0;
+        }
+
+        // --- Final Reduction ---
         if (T2 != 0 || T1 > PB1_ || (T1 == PB1_ && T0 >= PB0_)) {
-            uint64_t s0, s1;
-            unsigned char br = Sbb64(0, T0, PB0_, s0);
+            uint64_t s0 = 0, s1 = 0;
+            unsigned char b0 = 0;
+            unsigned char br = Sbb64(b0, T0, PB0_, s0);
             br = Sbb64(br, T1, PB1_, s1);
             T0 = s0; T1 = s1;
         }
+
         return Fpx::Make(T0, T1);
     }
 

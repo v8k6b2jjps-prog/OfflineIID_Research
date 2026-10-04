@@ -26,10 +26,7 @@ catch {
     # Priority changes are optional; continue if unavailable.
 }
 
-# ------------------------------------------------------------
-# Native P/Invoke
-# ------------------------------------------------------------
-
+#region Setup
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -1028,24 +1025,27 @@ $GetExtendedPid = {
         OfflineAct  = $offlineAct
     }
 }
+#endregion
+
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
 
 # Input [VerifyKey]
-$CdKey    = "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289"
-$Config   = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
+$KnowGroup = 0 #172
+$CdKey     = "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289"
+$Config    = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
 
 # Input [VerifyBinaryKey]
-$rawKey   = [BinaryKey]::EncodeBinaryKey($CdKey)
-$xml      = [System.IO.File]::ReadAllBytes($Config)
+$rawKey    = [BinaryKey]::EncodeBinaryKey($CdKey)
+$xml       = [System.IO.File]::ReadAllBytes($Config)
 
 # Output
-$group    = 0
-$uidBytes = [byte[]]::new(8)
+$group     = 0
+$uidBytes  = [byte[]]::new(8)
 
 # Set Timer
-$timer    = [System.Diagnostics.Stopwatch]::StartNew()
+$timer     = [System.Diagnostics.Stopwatch]::StartNew()
 
 try {
     
@@ -1063,9 +1063,8 @@ try {
     $success = [PkeyNative]::VerifyBinaryKey(
         $rawKey, $rawKey.Length,
         $xml,    $xml.Length,
-        $uidBytes,
-        [ref]$group,
-        0
+        $uidBytes, [ref]$group,
+        $KnowGroup
     )
 
 } finally {

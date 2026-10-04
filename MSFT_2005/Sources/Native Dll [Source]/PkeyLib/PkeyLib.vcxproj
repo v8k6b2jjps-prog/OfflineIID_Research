@@ -90,6 +90,8 @@
       <EnableUAC>false</EnableUAC>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <GenerateDebugInformation>false</GenerateDebugInformation>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
     </Link>
   </ItemDefinitionGroup>
   <!-- x86/x64 only: AVX2 and frame-pointer omission don't exist on ARM -->
@@ -101,6 +103,8 @@
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release' And ('$(Platform)'=='Win32' Or '$(Platform)'=='x64')">
     <ClCompile>
       <OmitFramePointers>true</OmitFramePointers>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <AdditionalOptions>%(AdditionalOptions) /Qpar /O2 /Oi /Gy</AdditionalOptions>
     </ClCompile>
   </ItemDefinitionGroup>
   <!-- Win32 needs the WIN32 define -->
