@@ -112,20 +112,34 @@ static std::vector<DWORD_PTR> GetPerformanceThreadMasks() {
 #endif
 
 extern "C" {
-    // High-performance Memory-Stream variant (Zero Disk I/O)
+    // Raw-buffer variant (Zero Disk I/O, no strings, no key decoding).
     //
-    // targetGroupId: 0  -> scan every group (dynamic, all P-threads)
-    //                >0 -> validate ONLY that group, inner MITM fully parallel
-    DLL_EXPORT bool VerifyKeyFromMemory(
-        const char* cdKeyStr,
-        const char* configXmlData,
-        int configXmlLen,
+    // rawKey / rawKeySize:
+    //     The already-encoded binary key: exactly the 16 bytes that
+    //     Helper::EncodeBinaryKey produces from the key text.
+    //     rawKeySize must be 16.
+    // xmlData / xmlSize:
+    //     The raw bytes of the pkeyconfig XML, exactly as stored on disk.
+    // outUid8Bytes:
+    //     Caller buffer, 8 bytes.
+    // outGroupId:
+    //     Optional, may be null.
+    // targetGroupId:
+    //     0  -> scan every group (dynamic, all P-threads)
+    //     >0 -> validate ONLY that group, inner MITM fully parallel
+    DLL_EXPORT bool VerifyBinaryKey(
+        const unsigned char* rawKey,
+        int rawKeySize,
+        const unsigned char* xmlData,
+        int xmlSize,
         unsigned char* outUid8Bytes,
         int* outGroupId,
         int targetGroupId
     ) {
         try {
-            if (!cdKeyStr || !configXmlData || configXmlLen <= 0 || !outUid8Bytes) {
+            if (!rawKey || rawKeySize != 16 ||
+                !xmlData || xmlSize <= 0 ||
+                !outUid8Bytes) {
                 return false;
             }
 
@@ -133,18 +147,10 @@ extern "C" {
             // so it can never race with the winner raising it below.
             H1Search::Abort.store(0, std::memory_order_relaxed);
 
-            std::string outerXml(configXmlData, configXmlLen);
+            // The key arrives already encoded; just copy the 16 bytes.
+            std::vector<unsigned char> bEncryptArray(rawKey, rawKey + 16);
 
-            std::vector<unsigned char> bEncryptArray;
-            try {
-                bEncryptArray = Helper::EncodeBinaryKey(std::string(cdKeyStr));
-            }
-            catch (const std::exception&) {
-                return false;
-            }
-            if (bEncryptArray.size() != 16) {
-                return false;
-            }
+            std::string outerXml(reinterpret_cast<const char*>(xmlData), (size_t)xmlSize);
 
             std::vector<PublicKeyEntry> pkEntries;
             if (!Helper::ParseKeyEntriesSimple(outerXml, pkEntries, InternalBase64Decode)) {
@@ -281,28 +287,9 @@ extern "C" {
         }
     }
 
-    // Legacy File-Path variant -> scans all groups (targetGroupId = 0).
-    DLL_EXPORT bool VerifyAndExtractKey(
-        const char* cdKeyStr,
-        const char* configFilePath,
-        unsigned char* outUid8Bytes,
-        int* outGroupId
-    ) {
-        try {
-            if (!configFilePath) return false;
-            std::ifstream file(configFilePath, std::ios::binary);
-            if (!file.is_open()) return false;
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string outerXml = buffer.str();
-            return VerifyKeyFromMemory(cdKeyStr, outerXml.data(), (int)outerXml.size(), outUid8Bytes, outGroupId, 0);
-        }
-        catch (...) {
-            return false;
-        }
-    }
-
-    DLL_EXPORT bool VerifyAndExtractKeyByRef(
+    // Convenience variant: key as text, config as a file path.
+    // Encodes the key to its 16 raw bytes, reads the file, scans every group.
+    DLL_EXPORT bool VerifyKey(
         const char* cdKeyStr,
         const char* configFilePath,
         unsigned char* outUid8Bytes,
@@ -319,6 +306,18 @@ extern "C" {
 
             *outGroupId = 0;
 
+            // Key text -> 16 raw bytes (VerifyKeyBytes no longer does this).
+            std::vector<unsigned char> rawKey;
+            try {
+                rawKey = Helper::EncodeBinaryKey(std::string(cdKeyStr));
+            }
+            catch (const std::exception&) {
+                return false;
+            }
+            if (rawKey.size() != 16) {
+                return false;
+            }
+
             std::ifstream file(configFilePath, std::ios::binary);
             if (!file.is_open()) {
                 return false;
@@ -332,9 +331,10 @@ extern "C" {
             unsigned char uid[8] = {};
             int groupId = 0;
 
-            const bool success = VerifyKeyFromMemory(
-                cdKeyStr,
-                outerXml.data(),
+            const bool success = VerifyBinaryKey(
+                rawKey.data(),
+                static_cast<int>(rawKey.size()),
+                reinterpret_cast<const unsigned char*>(outerXml.data()),
                 static_cast<int>(outerXml.size()),
                 uid,
                 &groupId,
@@ -348,76 +348,6 @@ extern "C" {
             std::memcpy(outUid8Bytes, uid, 8);
             *outGroupId = groupId;
 
-            return true;
-        }
-        catch (...) {
-            return false;
-        }
-    }
-
-    // Same as VerifyAndExtractKey but lets a caller pin a known group (warm path).
-    DLL_EXPORT bool VerifyAndExtractKeyG(
-        const char* cdKeyStr,
-        const char* configFilePath,
-        int targetGroupId,
-        unsigned char* outUid8Bytes,
-        int* outGroupId
-    ) {
-        try {
-            if (!configFilePath) return false;
-            std::ifstream file(configFilePath, std::ios::binary);
-            if (!file.is_open()) return false;
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string outerXml = buffer.str();
-            return VerifyKeyFromMemory(cdKeyStr, outerXml.data(), (int)outerXml.size(), outUid8Bytes, outGroupId, targetGroupId);
-        }
-        catch (...) {
-            return false;
-        }
-    }
-
-    // Raw variant: single pubkey, inner MITM fully parallel across P-cores.
-    DLL_EXPORT bool VerifyRawKeyAgainstPubKey(
-        const unsigned char* rawKey16,
-        const unsigned char* pubKeyBytes,
-        int pubKeyLen,
-        unsigned char* outUid8Bytes,
-        unsigned char* outH1Coeffs15,
-        char* outActPkeyConfigB64,
-        int outActPkeyConfigB64Len
-    ) {
-        try {
-            if (!rawKey16 || !pubKeyBytes || !outUid8Bytes || pubKeyLen <= 0) {
-                return false;
-            }
-
-            // Single search -> reset abort, and let it take all P-cores.
-            H1Search::Abort.store(0, std::memory_order_relaxed);
-            H1Search::FreeSlots.store(H1Search::TotalSlots(), std::memory_order_relaxed);
-
-            std::vector<unsigned char> bEncryptArray(rawKey16, rawKey16 + 16);
-            std::vector<unsigned char> pubKey(pubKeyBytes, pubKeyBytes + pubKeyLen);
-
-            std::string actPkeyConfig;
-            std::vector<unsigned char> h1Coeffs;
-            std::vector<unsigned char> uid;
-
-            bool success = PKeyCalc::TryPubKey(pubKey, bEncryptArray, actPkeyConfig, h1Coeffs, uid);
-            if (!success) return false;
-
-            if (uid.size() >= 8) std::memcpy(outUid8Bytes, uid.data(), 8);
-            else { std::memset(outUid8Bytes, 0, 8); std::memcpy(outUid8Bytes, uid.data(), uid.size()); }
-
-            if (outH1Coeffs15) {
-                std::memset(outH1Coeffs15, 0, 15);
-                std::memcpy(outH1Coeffs15, h1Coeffs.data(), (std::min)((size_t)15, h1Coeffs.size()));
-            }
-            if (outActPkeyConfigB64 && outActPkeyConfigB64Len > 0) {
-                size_t copyLen = (std::min)((size_t)(outActPkeyConfigB64Len - 1), actPkeyConfig.size());
-                std::memcpy(outActPkeyConfigB64, actPkeyConfig.data(), copyLen);
-                outActPkeyConfigB64[copyLen] = '\0';
-            }
             return true;
         }
         catch (...) {

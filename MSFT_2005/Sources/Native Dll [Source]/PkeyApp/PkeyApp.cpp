@@ -11,17 +11,14 @@
 
 namespace fs = std::filesystem;
 
-// Matches the Export.cpp you sent: 6 parameters, last one is targetGroupId.
-// If your DLL build really exports the 5-parameter version, remove the last
-// parameter here and the ", 0" in the call below.
+// Matches the new export file: VerifyKey takes a config FILE PATH and reads
+// the file itself (it scans every group, i.e. targetGroupId = 0 internally).
 extern "C" {
-    __declspec(dllimport) bool VerifyKeyFromMemory(
+    __declspec(dllimport) bool VerifyKey(
         const char* cdKeyStr,
-        const char* configXmlData,
-        int configXmlLen,
+        const char* configFilePath,
         unsigned char* outUid8Bytes,
-        int* outGroupId,
-        int targetGroupId
+        int* outGroupId
     );
 }
 
@@ -31,16 +28,6 @@ static void PrintHex(const unsigned char* data, size_t len, const char* label) {
         std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)data[i];
     }
     std::cout << std::dec << std::setfill(' ') << "\n";
-}
-
-// Loads a raw file into memory (Zero Disk I/O stream helper)
-static bool LoadRawFile(const fs::path& path, std::vector<unsigned char>& out) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) return false;
-    std::streamsize size = f.tellg();
-    f.seekg(0, std::ios::beg);
-    out.resize((size_t)size);
-    return (bool)f.read(reinterpret_cast<char*>(out.data()), size);
 }
 
 int main() {
@@ -73,15 +60,33 @@ int main() {
     int validCount = 0, invalidCount = 0, loadFailCount = 0;
 
     for (size_t i = 0; i < files.size(); i++) {
-        // Printed and flushed BEFORE the call: if the DLL crashes, the last
-        // line on screen is the file that did it.
-        std::cout << "\n[" << (i + 1) << "/" << files.size() << "] " << files[i].string() << std::endl;
-
-        std::vector<unsigned char> xmlBuffer;
-        if (!LoadRawFile(files[i], xmlBuffer)) {
-            std::cout << "  [ERROR] Failed to load config file into memory.\n";
+        // VerifyKey takes a narrow (ANSI code page) path. string() throws if
+        // the path has characters the code page cannot represent.
+        std::string pathStr;
+        try {
+            pathStr = files[i].string();
+        }
+        catch (const std::exception&) {
+            std::cout << "\n[" << (i + 1) << "/" << files.size() << "] "
+                      << "[ERROR] Path is not representable in the ANSI code page, skipped." << std::endl;
             loadFailCount++;
             continue;
+        }
+
+        // Printed and flushed BEFORE the call: if the DLL crashes, the last
+        // line on screen is the file that did it.
+        std::cout << "\n[" << (i + 1) << "/" << files.size() << "] " << pathStr << std::endl;
+
+        // VerifyKey returns false both for "cannot open the config" and for
+        // "key not valid". Probe the file the same way the DLL opens it, so
+        // the two cases stay separate in the report.
+        {
+            std::ifstream probe(pathStr.c_str(), std::ios::binary);
+            if (!probe.is_open()) {
+                std::cout << "  [ERROR] Config file could not be opened.\n";
+                loadFailCount++;
+                continue;
+            }
         }
 
         unsigned char uid[8] = { 0 };
@@ -89,13 +94,11 @@ int main() {
 
         auto startTime = std::chrono::high_resolution_clock::now();
 
-        bool success = VerifyKeyFromMemory(
+        bool success = VerifyKey(
             testCdKey,
-            reinterpret_cast<const char*>(xmlBuffer.data()),
-            (int)xmlBuffer.size(),
+            pathStr.c_str(),
             uid,
-            &groupId,
-            0   // scan every group in the file
+            &groupId
         );
 
         auto endTime = std::chrono::high_resolution_clock::now();
