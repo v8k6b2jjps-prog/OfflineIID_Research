@@ -240,8 +240,8 @@ public:
         // --- Iteration 0 (bx = b.A0) ---
         {
             uint64_t bx = b.A0;
-            uint64_t hi0, lo0 = _umul128(a.A0, bx, &hi0);
-            uint64_t hi1, lo1 = _umul128(a.A1, bx, &hi1);
+            uint64_t hi0, lo0 = MulWide64(a.A0, bx, hi0);
+            uint64_t hi1, lo1 = MulWide64(a.A1, bx, hi1);
 
             uint64_t P0 = lo0, P1 = 0, P2 = 0;
             unsigned char c0 = 0;
@@ -256,8 +256,8 @@ public:
 
             uint64_t m = T0 * N0INV;
 
-            uint64_t qhi0, qlo0 = _umul128(m, PB0_, &qhi0);
-            uint64_t qhi1, qlo1 = _umul128(m, PB1_, &qhi1);
+            uint64_t qhi0, qlo0 = MulWide64(m, PB0_, qhi0);
+            uint64_t qhi1, qlo1 = MulWide64(m, PB1_, qhi1);
             uint64_t Q0 = qlo0, Q1 = 0, Q2 = 0;
             unsigned char qc0 = 0;
             unsigned char qc = Adc64(qc0, qhi0, qlo1, Q1);
@@ -275,8 +275,8 @@ public:
         // --- Iteration 1 (bx = b.A1) ---
         {
             uint64_t bx = b.A1;
-            uint64_t hi0, lo0 = _umul128(a.A0, bx, &hi0);
-            uint64_t hi1, lo1 = _umul128(a.A1, bx, &hi1);
+            uint64_t hi0, lo0 = MulWide64(a.A0, bx, hi0);
+            uint64_t hi1, lo1 = MulWide64(a.A1, bx, hi1);
 
             uint64_t P0 = lo0, P1 = 0, P2 = 0;
             unsigned char c0 = 0;
@@ -291,8 +291,8 @@ public:
 
             uint64_t m = T0 * N0INV;
 
-            uint64_t qhi0, qlo0 = _umul128(m, PB0_, &qhi0);
-            uint64_t qhi1, qlo1 = _umul128(m, PB1_, &qhi1);
+            uint64_t qhi0, qlo0 = MulWide64(m, PB0_, qhi0);
+            uint64_t qhi1, qlo1 = MulWide64(m, PB1_, qhi1);
             uint64_t Q0 = qlo0, Q1 = 0, Q2 = 0;
             unsigned char qc0 = 0;
             unsigned char qc = Adc64(qc0, qhi0, qlo1, Q1);
