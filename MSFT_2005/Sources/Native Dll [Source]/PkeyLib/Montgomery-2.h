@@ -179,7 +179,7 @@ public:
             _rinv = BigInteger::ModPow(BigInteger(1) << 128, p - 2, p);
             One = FromBig(1);
             {   // bias = 32*p^2 (>= max negative lazy accumulator, multiple of p)
-                BigInteger Bb = p * p * BigInteger(64);
+                BigInteger Bb = p * p * BigInteger(32);
                 mpz_t bz; mpz_init(bz); mpz_set(bz, Bb.GetMpz());
                 for (int i = 0; i < 4; i++) BIASW[i] = Extract64(bz);
                 mpz_clear(bz);
@@ -493,46 +493,6 @@ public:
         Fp3m r; r.C0=c0; r.C1=c1; r.C2=c2; return r;
     }
 
-    // Fp3 multiply to UNreduced per-coordinate (POS,NEG) wide accumulators, for
-    // fully-lazy Fp6: lets the Fp6 combine happen before any reduction, so a
-    // whole Fp6 multiply needs only 6 reductions instead of 9.
-    FORCE_INLINE static void Mul3Wide(const Fp3m& A,const Fp3m& B,W4 POS[3],W4 NEG[3]){
-        const uint64_t a0=A.C0.A0,a0h=A.C0.A1,a1=A.C1.A0,a1h=A.C1.A1,a2=A.C2.A0,a2h=A.C2.A1;
-        const uint64_t b0=B.C0.A0,b0h=B.C0.A1,b1=B.C1.A0,b1h=B.C1.A1,b2=B.C2.A0,b2h=B.C2.A1;
-        uint64_t A01,A01h,B01,B01h,A02,A02h,B02,B02h,A12,A12h,B12,B12h; unsigned char cc;
-        cc=Fpm::Adc64(0,a0,a1,A01);Fpm::Adc64(cc,a0h,a1h,A01h); cc=Fpm::Adc64(0,b0,b1,B01);Fpm::Adc64(cc,b0h,b1h,B01h);
-        cc=Fpm::Adc64(0,a0,a2,A02);Fpm::Adc64(cc,a0h,a2h,A02h); cc=Fpm::Adc64(0,b0,b2,B02);Fpm::Adc64(cc,b0h,b2h,B02h);
-        cc=Fpm::Adc64(0,a1,a2,A12);Fpm::Adc64(cc,a1h,a2h,A12h); cc=Fpm::Adc64(0,b1,b2,B12);Fpm::Adc64(cc,b1h,b2h,B12h);
-        W4 d0,d1,d2,M01,M02,M12; z4(d0);z4(d1);z4(d2);z4(M01);z4(M02);z4(M12);
-        addmul2(d0,a0,a0h,b0,b0h); addmul2(d1,a1,a1h,b1,b1h); addmul2(d2,a2,a2h,b2,b2h);
-        addmul2(M01,A01,A01h,B01,B01h); addmul2(M02,A02,A02h,B02,B02h); addmul2(M12,A12,A12h,B12,B12h);
-        W4 t;
-        w4copy(POS[0],d0); w4copy(t,d1);w4muls(t,4);w4add(POS[0],t); w4copy(t,d2);w4muls(t,4);w4add(POS[0],t); w4copy(NEG[0],M12);w4muls(NEG[0],4);
-        w4copy(POS[1],M01); w4copy(NEG[1],d0);w4add(NEG[1],M12); w4copy(t,d2);w4muls(t,3);w4add(NEG[1],t);
-        w4copy(POS[2],M02);w4add(POS[2],d1); w4copy(NEG[2],d0); w4copy(t,d2);w4muls(t,2);w4add(NEG[2],t);
-    }
-    FORCE_INLINE static Fp6m Mul6Full(const Fp6m& a,const Fp6m& b){
-        Fp3m sA,sB;
-        sA.C0=Fpm::Add(a.R.C0,a.I.C0);sA.C1=Fpm::Add(a.R.C1,a.I.C1);sA.C2=Fpm::Add(a.R.C2,a.I.C2);
-        sB.C0=Fpm::Add(b.R.C0,b.I.C0);sB.C1=Fpm::Add(b.R.C1,b.I.C1);sB.C2=Fpm::Add(b.R.C2,b.I.C2);
-        W4 P0[3],N0[3],P1[3],N1[3],Pc[3],Nc[3];
-        Mul3Wide(a.R,b.R,P0,N0); Mul3Wide(a.I,b.I,P1,N1); Mul3Wide(sA,sB,Pc,Nc);
-        const W4 BIAS = *reinterpret_cast<const W4*>(Fpm::BIASW);
-        Fp6m r; W4 pos,neg,ac,t;
-        for(int i=0;i<3;i++){
-            // r0_i = d0_i - 2 d1_i
-            w4copy(pos,P0[i]); w4copy(t,N1[i]);w4muls(t,2);w4add(pos,t);
-            w4copy(neg,N0[i]); w4copy(t,P1[i]);w4muls(t,2);w4add(neg,t);
-            w4copy(ac,BIAS);w4add(ac,pos);w4sub(ac,neg); Fpx rr=RedcWide(ac);
-            // r1_i = cross_i - d0_i - d1_i
-            w4copy(pos,Pc[i]);w4add(pos,N0[i]);w4add(pos,N1[i]);
-            w4copy(neg,Nc[i]);w4add(neg,P0[i]);w4add(neg,P1[i]);
-            w4copy(ac,BIAS);w4add(ac,pos);w4sub(ac,neg); Fpx ri=RedcWide(ac);
-            if(i==0){r.R.C0=rr;r.I.C0=ri;} else if(i==1){r.R.C1=rr;r.I.C1=ri;} else {r.R.C2=rr;r.I.C2=ri;}
-        }
-        return r;
-    }
-
     FORCE_INLINE static Fp3m Mul3(const Fp3m& a, const Fp3m& b) {
         return Mul3Lazy(a,b);
     }
@@ -566,9 +526,6 @@ public:
     }
 
     FORCE_INLINE static Fp6m Mul6(const Fp6m& a, const Fp6m& b) {
-        return Mul6Full(a, b);
-    }
-    FORCE_INLINE static Fp6m Mul6_OLD(const Fp6m& a, const Fp6m& b) {
         Fp3m d0 = Mul3(a.R, b.R);
         Fp3m d1 = Mul3(a.I, b.I);
         Fp3m r0 = d0; SubMod(r0, r0, Dbl3(d1));
