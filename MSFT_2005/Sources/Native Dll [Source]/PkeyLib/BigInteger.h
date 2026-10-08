@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <vector>
 #include <mutex>
 #include <stdexcept>
@@ -126,6 +126,15 @@ public:
     static BigInteger Zero() { return BigInteger(0); }
     static BigInteger One() { return BigInteger(1); }
 
+    // One truncating division yielding BOTH quotient and remainder (like MS's
+    // mp_divrem_knuth), instead of a separate B/p and B%p. For non-negative
+    // B and p the remainder is already in [0,p).
+    static BigInteger DivRem(const BigInteger& n, const BigInteger& d, BigInteger& rem) {
+        BigInteger q;
+        mpz_tdiv_qr(q.val, rem.val, n.val, d.val);
+        return q;
+    }
+
     // GMP 模幂加速
     static BigInteger ModPow(const BigInteger& base, const BigInteger& exp, const BigInteger& mod) {
         BigInteger res;
@@ -228,11 +237,15 @@ public:
 class Gf {
 private:
     inline static BigInteger _p = 0;
-    inline static std::mutex _pGate;
+    inline static std::mutex _pGate;   // guards WRITES only (parse phase)
 
 public:
+    // Lock-free read. Safe because all writes (SetP) happen during the serial
+    // parse phase, before any worker thread starts -- thread creation provides
+    // the happens-before. This mirrors MS, which keeps p in static storage and
+    // never locks on read; it removes a global-mutex acquire that every Fp3/
+    // Curve/lift_x op was paying, 16x contended under the parallel scan.
     static BigInteger GetP() {
-        std::lock_guard<std::mutex> lock(_pGate);
         return _p;
     }
 

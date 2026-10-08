@@ -32,6 +32,17 @@ Copy Dll To Release Folder
 #define FORCE_INLINE inline __attribute__((always_inline))
 #endif
 
+// Same gate the scalar Fpm::Mul already uses for its ADX/ADCX-ADOX path.
+// When set, the lazy Fp3/Fp6 accumulators (addmul2 / RedcWide) -- the inner
+// loop of the MITM's 93% -- also use _mulx_u64 + dual (ADCX/ADOX) carry
+// chains instead of _umul128 + a single _addcarry chain.
+#if (defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)) \
+    && (defined(_M_X64) || defined(__x86_64__)) && !defined(PKEY_NO_ADX)
+#define PKEY_ADX_LAZY 1
+#else
+#define PKEY_ADX_LAZY 0
+#endif
+
 // -------------------------------------------------------------------------
 // 64-bit-limb Fpx: value = A0 + A1*2^64, Montgomery form of an Fp element
 // (R = 2^128, same range as the previous four-32-bit-limb representation,
@@ -436,6 +447,30 @@ public:
     FORCE_INLINE static void w4sub(W4& r,const W4& a){ unsigned char b=0; for(int i=0;i<4;i++) b=Fpm::Sbb64(b,r.w[i],a.w[i],r.w[i]); }
     FORCE_INLINE static void w4muls(W4& r,uint64_t k){ uint64_t carry=0; for(int i=0;i<4;i++){ uint64_t h,l=Fpm::MulWide64(r.w[i],k,h); unsigned char c=Fpm::Adc64(0,l,carry,r.w[i]); carry=h+c; } }
     // r += (a0 + a1<<64) * (b0 + b1<<64)   (operands < 2^112; r stays < 2^256 for our magnitudes)
+#if PKEY_ADX_LAZY
+    // Two 2-limb columns (b0, then b1<<64). Within each column the low-word
+    // adds run on the ADOX/OF chain and the high-word adds on the ADCX/CF
+    // chain, exactly like the scalar Fpm::Mul. _mulx_u64 produces hi:lo
+    // without touching the flags, so neither chain is disturbed by the
+    // multiply. Verified bit-for-bit vs the portable version below.
+    FORCE_INLINE static void addmul2(W4& r,uint64_t a0,uint64_t a1,uint64_t b0,uint64_t b1){
+        unsigned long long w0=r.w[0],w1=r.w[1],w2=r.w[2],w3=r.w[3];
+        unsigned long long hi,lo; unsigned char cf,of;
+        // --- column b0 -> limbs 0,1,2 (carry into 3) ---
+        cf=0; of=0;
+        lo=_mulx_u64(a0,b0,&hi); of=_addcarryx_u64(of,w0,lo,&w0); cf=_addcarryx_u64(cf,w1,hi,&w1);
+        lo=_mulx_u64(a1,b0,&hi); of=_addcarryx_u64(of,w1,lo,&w1); cf=_addcarryx_u64(cf,w2,hi,&w2);
+        of=_addcarryx_u64(of,w2,0,&w2);              // flush OF chain into limb 2
+        cf=_addcarryx_u64(cf,w3,0,&w3);              // flush CF chain into limb 3
+        // --- column b1 -> limbs 1,2,3 ---
+        cf=0; of=0;
+        lo=_mulx_u64(a0,b1,&hi); of=_addcarryx_u64(of,w1,lo,&w1); cf=_addcarryx_u64(cf,w2,hi,&w2);
+        lo=_mulx_u64(a1,b1,&hi); of=_addcarryx_u64(of,w2,lo,&w2); cf=_addcarryx_u64(cf,w3,hi,&w3);
+        of=_addcarryx_u64(of,w3,0,&w3);              // flush OF chain into limb 3
+        (void)cf;                                    // magnitudes keep r < 2^256: CF out of limb 3 is 0
+        r.w[0]=w0; r.w[1]=w1; r.w[2]=w2; r.w[3]=w3;
+    }
+#else
     FORCE_INLINE static void addmul2(W4& r,uint64_t a0,uint64_t a1,uint64_t b0,uint64_t b1){
         uint64_t h,l; unsigned char c;
         l=Fpm::MulWide64(a0,b0,h); c=Fpm::Adc64(0,r.w[0],l,r.w[0]); c=Fpm::Adc64(c,r.w[1],h,r.w[1]); c=Fpm::Adc64(c,r.w[2],0,r.w[2]); Fpm::Adc64(c,r.w[3],0,r.w[3]);
@@ -443,10 +478,37 @@ public:
         l=Fpm::MulWide64(a0,b1,h); c=Fpm::Adc64(0,r.w[1],l,r.w[1]); c=Fpm::Adc64(c,r.w[2],h,r.w[2]); Fpm::Adc64(c,r.w[3],0,r.w[3]);
         l=Fpm::MulWide64(a1,b0,h); c=Fpm::Adc64(0,r.w[1],l,r.w[1]); c=Fpm::Adc64(c,r.w[2],h,r.w[2]); Fpm::Adc64(c,r.w[3],0,r.w[3]);
     }
+#endif
+    // r += (a0 + a1<<64)^2 : identical result to addmul2(r,a0,a1,a0,a1) but the
+    // a0*a1 cross product is computed ONCE and added twice -> 3 wide muls, not 4.
+    // Used by the dedicated field squaring (Sqr3/Sqr6).
+    FORCE_INLINE static void sqrmul2(W4& r,uint64_t a0,uint64_t a1){
+        uint64_t h,l; unsigned char c;
+        l=Fpm::MulWide64(a0,a0,h); c=Fpm::Adc64(0,r.w[0],l,r.w[0]); c=Fpm::Adc64(c,r.w[1],h,r.w[1]); c=Fpm::Adc64(c,r.w[2],0,r.w[2]); Fpm::Adc64(c,r.w[3],0,r.w[3]);
+        l=Fpm::MulWide64(a1,a1,h); c=Fpm::Adc64(0,r.w[2],l,r.w[2]); Fpm::Adc64(c,r.w[3],h,r.w[3]);
+        l=Fpm::MulWide64(a0,a1,h);
+        for(int t=0;t<2;t++){ c=Fpm::Adc64(0,r.w[1],l,r.w[1]); c=Fpm::Adc64(c,r.w[2],h,r.w[2]); Fpm::Adc64(c,r.w[3],0,r.w[3]); }
+    }
+
     // Montgomery-reduce a 4-limb value (< p*2^128) to Fpx  (= value * R^-1 mod p)
     FORCE_INLINE static Fpx RedcWide(const W4& A){
         uint64_t a[6]={A.w[0],A.w[1],A.w[2],A.w[3],0,0};
         const uint64_t p0=Fpm::PB0_, p1=Fpm::PB1_, ninv=Fpm::N0INV;
+#if PKEY_ADX_LAZY
+        for(int i=0;i<2;i++){
+            const unsigned long long m=a[i]*ninv;
+            unsigned long long hi,lo, ai=a[i], ai1=a[i+1], ai2=a[i+2], ai3=a[i+3], ai4=a[i+4];
+            unsigned char cf=0, of=0;
+            // a[i..i+2] += m*p ; low chain = ADOX/OF, high chain = ADCX/CF
+            lo=_mulx_u64(m,p0,&hi); of=_addcarryx_u64(of,ai, lo,&ai);  cf=_addcarryx_u64(cf,ai1,hi,&ai1);
+            lo=_mulx_u64(m,p1,&hi); of=_addcarryx_u64(of,ai1,lo,&ai1); cf=_addcarryx_u64(cf,ai2,hi,&ai2);
+            // a[i] (==ai) is now 0 by construction; fold the two pending carries upward
+            unsigned char cc = _addcarry_u64(0,  ai2, (unsigned long long)of, &ai2);
+            unsigned char cd = _addcarry_u64(cc, ai3, (unsigned long long)cf, &ai3);
+            _addcarry_u64(cd, ai4, 0, &ai4);
+            a[i]=ai; a[i+1]=ai1; a[i+2]=ai2; a[i+3]=ai3; a[i+4]=ai4;
+        }
+#else
         for(int i=0;i<2;i++){
             uint64_t m=a[i]*ninv;
             uint64_t h0,l0=Fpm::MulWide64(m,p0,h0);
@@ -459,6 +521,7 @@ public:
             c=Fpm::Adc64(c,a[i+3],0, a[i+3]);
             Fpm::Adc64(c,a[i+4],0, a[i+4]);
         }
+#endif
         uint64_t r0=a[2], r1=a[3];
         if(a[4] || r1>Fpm::PB1_ || (r1==Fpm::PB1_ && r0>=Fpm::PB0_)){
             uint64_t s0,s1; unsigned char br=Fpm::Sbb64(0,r0,Fpm::PB0_,s0); Fpm::Sbb64(br,r1,Fpm::PB1_,s1); r0=s0; r1=s1;
@@ -532,6 +595,50 @@ public:
         }
         return r;
     }
+
+    // Squaring: same wide-accumulator combine as Mul3Wide with B==A, but each
+    // of the 6 terms uses sqrmul2 (3 muls) instead of addmul2 (4). Result is
+    // bit-identical to Mul3Wide(A,A,...).
+    FORCE_INLINE static void Sqr3Wide(const Fp3m& A, W4 POS[3], W4 NEG[3]){
+        const uint64_t a0=A.C0.A0,a0h=A.C0.A1,a1=A.C1.A0,a1h=A.C1.A1,a2=A.C2.A0,a2h=A.C2.A1;
+        uint64_t A01,A01h,A02,A02h,A12,A12h; unsigned char cc;
+        cc=Fpm::Adc64(0,a0,a1,A01);Fpm::Adc64(cc,a0h,a1h,A01h);
+        cc=Fpm::Adc64(0,a0,a2,A02);Fpm::Adc64(cc,a0h,a2h,A02h);
+        cc=Fpm::Adc64(0,a1,a2,A12);Fpm::Adc64(cc,a1h,a2h,A12h);
+        W4 d0,d1,d2,M01,M02,M12; z4(d0);z4(d1);z4(d2);z4(M01);z4(M02);z4(M12);
+        sqrmul2(d0,a0,a0h); sqrmul2(d1,a1,a1h); sqrmul2(d2,a2,a2h);
+        sqrmul2(M01,A01,A01h); sqrmul2(M02,A02,A02h); sqrmul2(M12,A12,A12h);
+        W4 t;
+        w4copy(POS[0],d0); w4copy(t,d1);w4muls(t,4);w4add(POS[0],t); w4copy(t,d2);w4muls(t,4);w4add(POS[0],t); w4copy(NEG[0],M12);w4muls(NEG[0],4);
+        w4copy(POS[1],M01); w4copy(NEG[1],d0);w4add(NEG[1],M12); w4copy(t,d2);w4muls(t,3);w4add(NEG[1],t);
+        w4copy(POS[2],M02);w4add(POS[2],d1); w4copy(NEG[2],d0); w4copy(t,d2);w4muls(t,2);w4add(NEG[2],t);
+    }
+    FORCE_INLINE static Fp6m Sqr6Full(const Fp6m& a){
+        Fp3m sA;
+        sA.C0=Fpm::Add(a.R.C0,a.I.C0);sA.C1=Fpm::Add(a.R.C1,a.I.C1);sA.C2=Fpm::Add(a.R.C2,a.I.C2);
+        W4 P0[3],N0[3],P1[3],N1[3],Pc[3],Nc[3];
+        Sqr3Wide(a.R,P0,N0); Sqr3Wide(a.I,P1,N1); Sqr3Wide(sA,Pc,Nc);
+        const W4 BIAS = *reinterpret_cast<const W4*>(Fpm::BIASW);
+        Fp6m r; W4 pos,neg,ac,t;
+        for(int i=0;i<3;i++){
+            w4copy(pos,P0[i]); w4copy(t,N1[i]);w4muls(t,2);w4add(pos,t);
+            w4copy(neg,N0[i]); w4copy(t,P1[i]);w4muls(t,2);w4add(neg,t);
+            w4copy(ac,BIAS);w4add(ac,pos);w4sub(ac,neg); Fpx rr=RedcWide(ac);
+            w4copy(pos,Pc[i]);w4add(pos,N0[i]);w4add(pos,N1[i]);
+            w4copy(neg,Nc[i]);w4add(neg,P0[i]);w4add(neg,P1[i]);
+            w4copy(ac,BIAS);w4add(ac,pos);w4sub(ac,neg); Fpx ri=RedcWide(ac);
+            if(i==0){r.R.C0=rr;r.I.C0=ri;} else if(i==1){r.R.C1=rr;r.I.C1=ri;} else {r.R.C2=rr;r.I.C2=ri;}
+        }
+        return r;
+    }
+    FORCE_INLINE static Fp3m Sqr3(const Fp3m& a){ W4 P[3],N[3]; Sqr3Wide(a,P,N);
+        const W4 BIAS=*reinterpret_cast<const W4*>(Fpm::BIASW); Fp3m r; W4 ac;
+        w4copy(ac,BIAS); w4add(ac,P[0]); w4sub(ac,N[0]); r.C0=RedcWide(ac);
+        w4copy(ac,BIAS); w4add(ac,P[1]); w4sub(ac,N[1]); r.C1=RedcWide(ac);
+        w4copy(ac,BIAS); w4add(ac,P[2]); w4sub(ac,N[2]); r.C2=RedcWide(ac);
+        return r;
+    }
+    FORCE_INLINE static Fp6m Sqr6(const Fp6m& a){ return Sqr6Full(a); }
 
     FORCE_INLINE static Fp3m Mul3(const Fp3m& a, const Fp3m& b) {
         return Mul3Lazy(a,b);
@@ -617,10 +724,81 @@ public:
         Fp6m r = One(), b = a;
         while (!e.IsZero() && e > 0) {
             if (!(e & 1).IsZero()) r = Mul6(r, b);
-            b = Mul6(b, b);
+            b = Sqr6(b);               // dedicated squaring (was Mul6(b,b))
             e >>= 1;
         }
         return r;
+    }
+
+    // ---- Frobenius (x -> x^p) and the x^(p^3) conjugate -----------------
+    // Precomputed once: u^p and u^(2p) as Fp3 constants, and whether y^p = -y.
+    // In GF(p)[u]/(u^3+u+4) with a_i in Fp:  (a0+a1 u+a2 u^2)^p = a0 + a1 u^p
+    // + a2 u^(2p). Over the y^2+2 extension: (c0+c1 y)^p = c0^p + (y^p/y) c1^p y.
+    inline static Fp3m FrU1{}, FrU2{};
+    inline static bool  FrNegY = false;
+    inline static std::once_flag _frFlag;
+    static void FrobInit() {
+        std::call_once(_frFlag, []() {
+            BigInteger p = Gf::GetP();
+            Fp3 u(0, 1, 0);
+            Fp3 U1 = u.Pow(p);         // u^p
+            Fp3 U2 = U1 * U1;          // u^(2p) = (u^p)^2
+            FrU1 = Fp3m::FromFp3(U1);
+            FrU2 = Fp3m::FromFp3(U2);
+            BigInteger negTwo = Gf::Mod(BigInteger(-2));
+            BigInteger eps = BigInteger::ModPow(negTwo, (p - 1) / 2, p); // (-2)^((p-1)/2) = +/-1
+            FrNegY = !eps.IsOne();     // y^p = eps * y
+        });
+    }
+    // Fp3 Frobenius: a0 + a1*U1 + a2*U2  (a_i are Fp scalars -> scalar*Fp3)
+    FORCE_INLINE static Fp3m Frob3(const Fp3m& a) {
+        Fp3m r;
+        r.C0 = a.C0; r.C1 = Fpm::FromBig(0); r.C2 = Fpm::FromBig(0);
+        Fpx t0,t1,t2;
+        t0=Fpm::Mul(a.C1,FrU1.C0); t1=Fpm::Mul(a.C1,FrU1.C1); t2=Fpm::Mul(a.C1,FrU1.C2);
+        r.C0=Fpm::Add(r.C0,t0); r.C1=Fpm::Add(r.C1,t1); r.C2=Fpm::Add(r.C2,t2);
+        t0=Fpm::Mul(a.C2,FrU2.C0); t1=Fpm::Mul(a.C2,FrU2.C1); t2=Fpm::Mul(a.C2,FrU2.C2);
+        r.C0=Fpm::Add(r.C0,t0); r.C1=Fpm::Add(r.C1,t1); r.C2=Fpm::Add(r.C2,t2);
+        return r;
+    }
+    FORCE_INLINE static Fp3m NegC(const Fp3m& a){ Fpx z=Fpm::FromBig(0);
+        Fp3m r; r.C0=Fpm::Sub(z,a.C0); r.C1=Fpm::Sub(z,a.C1); r.C2=Fpm::Sub(z,a.C2); return r; }
+    // x^p
+    static Fp6m FrobP(const Fp6m& a) {
+        FrobInit();
+        Fp6m r; r.R = Frob3(a.R); r.I = Frob3(a.I);
+        if (FrNegY) r.I = NegC(r.I);
+        return r;
+    }
+    // x^(p^3): fixes Fp3, sends y -> -y, i.e. the Fp6/Fp3 conjugate (c0, -c1).
+    static Fp6m Conj(const Fp6m& a) { Fp6m r; r.R = a.R; r.I = NegC(a.I); return r; }
+
+    static Fp3m One3(){ Fp3m r; r.C0=Fpm::One; r.C1=Fpm::FromBig(0); r.C2=Fpm::FromBig(0); return r; }
+    // Fp3 inverse by Fermat (a^(p^3-2)). ONE Fp3 inverse per final exp -- far
+    // cheaper than a full Fp6 inverse. (Upgradeable to Itoh-Tsujii: reduce to a
+    // single Fp inverse + Frobenius; left simple here.)
+    static Fp3m Inv3(const Fp3m& a){
+        BigInteger e = Gf::GetP(); e = e*e*e - BigInteger(2);
+        Fp3m r=One3(), b=a;
+        while(!e.IsZero() && e>0){ if(!(e&1).IsZero()) r=Mul3(r,b); b=Sqr3(b); e>>=1; }
+        return r;
+    }
+    // Easy part of the final exponentiation, f^(p^3-1), WITHOUT a full Fp6
+    // inverse: f^-1 = Conj(f)/norm(f), norm(f)=f*Conj(f) in Fp3; so
+    // f^(p^3-1) = Conj(f) * f^-1 = Conj(f) * Conj(f) * norm^-1.
+    static Fp6m EasyPart(const Fp6m& f){
+        Fp6m cf = Conj(f);
+        Fp6m nf = Mul6(f, cf);                 // norm lives in nf.R, nf.I == 0
+        Fp3m ninv = Inv3(nf.R);
+        Fp6m finv; finv.R = Mul3(cf.R, ninv); finv.I = Mul3(cf.I, ninv);  // f^-1
+        return Mul6(cf, finv);                 // f^(p^3-1)
+    }
+    // Frobenius-factored final exponentiation: f^((p^6-1)/n)
+    //   = ( f^(p^3-1) ) ^ ( (p^3+1)/n ).
+    // Caller passes hardExp = (p^3+1)/n (n = curve order). Replaces a ~550-bit
+    // PowBig over the full E with an inverse-free easy part + a ~220-bit PowBig.
+    static Fp6m FinalExp(const Fp6m& f, const BigInteger& hardExp){
+        return PowBig(EasyPart(f), hardExp);
     }
 
     static Fp6 ToFp6(const Fp6m& a) {
