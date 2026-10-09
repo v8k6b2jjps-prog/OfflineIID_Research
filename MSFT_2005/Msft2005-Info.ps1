@@ -328,6 +328,7 @@ $valExe  = Join-Path $PSScriptRoot "Binary\Validator.exe"
 $valxExe = Join-Path $PSScriptRoot "Binary\MiniValidator.exe"
 $hModule = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $DllPath
 
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $tmpPtr  = New-IntPtr -Size 8
 $func1 = [NativeInterop]::GetTargetAddress($hModule, 0x180015270)
 [NativeInterop]::Call($func1, $tmpPtr, [IntPtr]::Zero) | Out-Null
@@ -379,6 +380,9 @@ Write-Host "Group ID     : $GroupIDValue (0x$($GroupIDValue.ToString('X')))"
 Write-Host "Serial       : $KeyIDValue (0x$($KeyIDValue.ToString('X')))"
 Write-Host "Security     : $SecurityValue (0x$($SecurityValue.ToString('X')))" -ForegroundColor Cyan
 Write-Host "Final String : $FinalString" -ForegroundColor Yellow
+$stopwatch.Stop()
+Write-Host
+Write-Host "[Timer] Execution completed in: $($stopwatch.ElapsedMilliseconds) ms ($($stopwatch.Elapsed.TotalSeconds) seconds)" -ForegroundColor Magenta
 Write-Host
 
 $SerialA = [Marshal]::ReadInt32($HeapPtr, 0x3C)
