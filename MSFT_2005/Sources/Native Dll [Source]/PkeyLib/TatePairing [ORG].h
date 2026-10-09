@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <cstdint>
 #include "BigInteger.h"
 #include "Montgomery.h"
@@ -157,15 +157,6 @@ public:
         return Fp6mOp::PowBigM(Fp6mOp::ToFp6(f), e);
     }
 
-    // s * a for a base-field scalar s: six Fp multiplies. Same value as
-    // Mul6(FromFpxEmbedding(s), a), without the full Fp6 multiply.
-    FORCE_INLINE static Fp6m ScaleFp(const Fpx& s, const Fp6m& a) {
-        Fp6m r;
-        r.R.C0 = Fpm::Mul(s, a.R.C0); r.R.C1 = Fpm::Mul(s, a.R.C1); r.R.C2 = Fpm::Mul(s, a.R.C2);
-        r.I.C0 = Fpm::Mul(s, a.I.C0); r.I.C1 = Fpm::Mul(s, a.I.C1); r.I.C2 = Fpm::Mul(s, a.I.C2);
-        return r;
-    }
-
     // Shared-ladder multi-pairing: runs the T-side Miller ladder ONCE and
     // evaluates the line function against every Q in the batch at each step,
     // instead of re-running the whole ladder (and re-paying every inversion)
@@ -217,21 +208,18 @@ public:
                 Fpx y2 = Fpm::Sub(Fpm::Mul(lam, Fpm::Sub(vxm, x2)), vym);
                 vxm = x2; vym = y2;
             }
-            // V's coordinates are the same for every Q: embed them once.
-            Fp6m embVy{}, embVx{};
-            if (dcase == NORMAL) {
-                embVy = Fp6mOp::FromFpxEmbedding(vyOld);
-                embVx = Fp6mOp::FromFpxEmbedding(vxOld);
-            }
             for (int j = 0; j < m; j++) {
                 if (dcase == NORMAL) {
+                    Fp6m embVy = Fp6mOp::FromFpxEmbedding(vyOld);
+                    Fp6m embVx = Fp6mOp::FromFpxEmbedding(vxOld);
+                    Fp6m embLam = Fp6mOp::FromFpxEmbedding(lam);
                     Fp6m term1 = Fp6mOp::Sub6(Qy[j], embVy);
-                    Fp6m term2 = ScaleFp(lam, Fp6mOp::Sub6(Qx[j], embVx));
+                    Fp6m term2 = Fp6mOp::Mul6(embLam, Fp6mOp::Sub6(Qx[j], embVx));
                     Fp6m l = Fp6mOp::Sub6(term1, term2);
-                    f[j] = Fp6mOp::Mul6(Fp6mOp::Sqr6(f[j]), l);
+                    f[j] = Fp6mOp::Mul6(Fp6mOp::Mul6(f[j], f[j]), l);
                 }
                 else if (dcase == WAS_INF) {
-                    f[j] = Fp6mOp::Sqr6(f[j]);
+                    f[j] = Fp6mOp::Mul6(f[j], f[j]);
                 }
                 // BECAME_INF: untouched, matches original
             }
@@ -278,19 +266,17 @@ public:
                     vxm = x3; vym = y3;
                 }
 
-                Fp6m embAddVy{}, embAddVx{};
-                if (!tookT && (becameInf || haveAddLine)) {
-                    embAddVx = Fp6mOp::FromFpxEmbedding(addVxOld);
-                    if (haveAddLine) embAddVy = Fp6mOp::FromFpxEmbedding(addVyOld);
-                }
                 for (int j = 0; j < m; j++) {
                     if (tookT) continue; // pure reset, no line factor multiplied in original code
                     if (becameInf) {
-                        f[j] = Fp6mOp::Mul6(f[j], Fp6mOp::Sub6(Qx[j], embAddVx));
+                        f[j] = Fp6mOp::Mul6(f[j], Fp6mOp::Sub6(Qx[j], Fp6mOp::FromFpxEmbedding(addVxOld)));
                     }
                     else if (haveAddLine) {
-                        Fp6m term1 = Fp6mOp::Sub6(Qy[j], embAddVy);
-                        Fp6m term2 = ScaleFp(addLam, Fp6mOp::Sub6(Qx[j], embAddVx));
+                        Fp6m embVy = Fp6mOp::FromFpxEmbedding(addVyOld);
+                        Fp6m embVx = Fp6mOp::FromFpxEmbedding(addVxOld);
+                        Fp6m embLam = Fp6mOp::FromFpxEmbedding(addLam);
+                        Fp6m term1 = Fp6mOp::Sub6(Qy[j], embVy);
+                        Fp6m term2 = Fp6mOp::Mul6(embLam, Fp6mOp::Sub6(Qx[j], embVx));
                         Fp6m l = Fp6mOp::Sub6(term1, term2);
                         f[j] = Fp6mOp::Mul6(f[j], l);
                     }
@@ -298,22 +284,11 @@ public:
             }
         }
 
-        // Final exponentiation f^((p^6-1)/n).  (p^6-1)/n = (p^3-1) * ((p^3+1)/n),
-        // and f^(p^3-1) costs one conjugate and one Fp3 inverse, which leaves a
-        // power less than half as long. Only valid when n divides p^3+1 (true
-        // for every pairing-friendly 2005 curve); otherwise use the plain power.
         BigInteger p = Gf::GetP();
-        BigInteger p3 = IntegerPow(p, 3);
+        BigInteger p6 = IntegerPow(p, 6);
+        BigInteger e = (p6 - 1) / n;
         std::vector<Fp6> out(m);
-        if (((p3 + 1) % n).IsZero()) {
-            BigInteger hard = (p3 + 1) / n;
-            for (int j = 0; j < m; j++) out[j] = Fp6mOp::ToFp6(Fp6mOp::FinalExp(f[j], hard));
-        }
-        else {
-            BigInteger p6 = IntegerPow(p, 6);
-            BigInteger e = (p6 - 1) / n;
-            for (int j = 0; j < m; j++) out[j] = Fp6mOp::PowBigM(Fp6mOp::ToFp6(f[j]), e);
-        }
+        for (int j = 0; j < m; j++) out[j] = Fp6mOp::PowBigM(Fp6mOp::ToFp6(f[j]), e);
         return out;
     }
 };

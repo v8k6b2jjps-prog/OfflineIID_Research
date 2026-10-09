@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "pch.h"
 #include <vector>
 #include <string>
@@ -202,8 +202,7 @@ private:
         h1[2] = (unsigned char)(keyByte % b1);
         h1[3] = (unsigned char)((keyByte / b1) % b2);
 
-        // 1/(-2) is a base-field scalar: one Fp inversion, not an Fp3 power.
-        Fp3 inv2(Gf::Inv(BigInteger(-2)), 0, 0);
+        Fp3 inv2 = Fp3(-2, 0, 0).Inverse();
         Fp3 inv2sq = inv2 * inv2;
         int np = (int)k.Points.size();
 
@@ -230,12 +229,7 @@ private:
         // MITM parallelizes across all cores; when many entries run at once,
         // the budget keeps total threads near hardware_concurrency instead of
         // oversubscribing. Mirrors the C# reference's nested Parallel.For.
-        // 1/pv. A pairing value is unitary, so its inverse is its conjugate
-        // (c0, -c1); one multiply confirms that, and anything else falls back
-        // to the real inversion.
-        Fp6 target(pv.C0, -pv.C1);
-        if (pv * target != Fp6::One()) target = Fp6::One() / pv;
-        std::vector<int> sol = H1Search::Solve(g, target, lo, hi, note, 0);
+        std::vector<int> sol = H1Search::Solve(g, Fp6::One() / pv, lo, hi, note, 0);
         if (sol.empty()) return false;
 
         for (int i = 3; i < np; i++) {
