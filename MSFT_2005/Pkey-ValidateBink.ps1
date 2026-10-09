@@ -916,7 +916,7 @@ function Get-PkeyInfo {
     param(
         [byte[]]$Uid,
         [int]$Group,
-        [string[]]$ConfigPath,
+        [string]$ConfigPath,
         [string]$ScriptDir = $PSScriptRoot,
         [switch]$Skip
     )
@@ -943,29 +943,36 @@ function Get-PkeyInfo {
         # --- Find Configuration + KeyRange for Group/Serial, across the files ---
         $cfg = $null; $range = $null; $actId = $null; $usedConfig = $null
 
-        foreach ($cp in $ConfigPath) {
-            if ([string]::IsNullOrWhiteSpace($cp) -or -not (Test-Path -LiteralPath $cp)) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($ConfigPath) -and (Test-Path -LiteralPath $ConfigPath)) {
             try {
-                [xml]$xrm = Get-Content -LiteralPath $cp -Raw
+                [xml]$xrm = Get-Content -LiteralPath $ConfigPath -Raw
                 $bin = $xrm.SelectSingleNode("//*[local-name()='infoBin'][@name='pkeyConfigData']")
-                if (-not $bin) { continue }
-                $bytes = [Convert]::FromBase64String(($bin.InnerText -replace '\s', ''))
-                [xml]$pkey = (& $decode $bytes).TrimStart([char]0xFEFF)
-            } catch { Write-Verbose "skip $cp : $($_.Exception.Message)"; continue }
-
-            foreach ($c in $pkey.SelectNodes("//*[local-name()='Configuration'][*[local-name()='RefGroupId']='$Group']")) {
-                $id = & $get $c 'ActConfigId'
-                if (-not $id) { continue }
-                foreach ($r in $pkey.SelectNodes("//*[local-name()='KeyRange'][*[local-name()='RefActConfigId']='$id']")) {
-                    $s = [uint64]0; $e = [uint64]0
-                    if (-not [uint64]::TryParse((& $get $r 'Start'), [ref]$s)) { continue }
-                    if (-not [uint64]::TryParse((& $get $r 'End'),   [ref]$e)) { continue }
-                    if ($serial -ge $s -and $serial -le $e) { $range = $r; break }
+                if (-not $bin) { $pkey = $null }
+                else {
+                    $bytes = [Convert]::FromBase64String(($bin.InnerText -replace '\s',''))
+                    [xml]$pkey = (& $decode $bytes).TrimStart([char]0xFEFF)
                 }
-                if ($range) { $cfg = $c; $actId = $id; break }
+            } catch { Write-Verbose "skip $ConfigPath : $($_.Exception.Message)"; continue }
+
+            if ($pkey) {
+                foreach ($c in $pkey.SelectNodes("//*[local-name()='Configuration'][*[local-name()='RefGroupId']='$Group']")) {
+                    $id = & $get $c 'ActConfigId'
+                    if (-not $id) { continue }
+                    foreach ($r in $pkey.SelectNodes("//*[local-name()='KeyRange'][*[local-name()='RefActConfigId']='$id']")) {
+                        $s = [uint64]0; $e = [uint64]0
+                        if (-not [uint64]::TryParse((& $get $r 'Start'), [ref]$s)) { continue }
+                        if (-not [uint64]::TryParse((& $get $r 'End'),   [ref]$e)) { continue }
+                        if ($serial -ge $s -and $serial -le $e) { $range = $r; break }
+                    }
+                    if ($range) { 
+                        $cfg = $c; 
+                        $actId = $id; 
+                        break 
+                    }
+                }
             }
-            if ($range) { $usedConfig = $cp; break }
         }
+        if ($range) { $usedConfig = $ConfigPath; }
     }
 
     # --- ActString: msft2005:<guid>&<base64(upgrade | serial<<1 | auth<<31)> --
@@ -979,9 +986,6 @@ function Get-PkeyInfo {
     # --- HWID from installed Windows product + new offline IID --------------
     $hwid = $null
     $offlineAct = $null
-    $iid = (Get-CimInstance -Query ("SELECT OfflineInstallationId FROM SoftwareLicensingProduct " +
-            "WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL") |
-            Select-Object -First 1).OfflineInstallationId
 
     if (-not $hwid -and $iid) {
         try { $hwid = Get-IidHwid $iid } catch {}
@@ -1390,14 +1394,37 @@ $Method = 'Binks'
 
 # Base Input
 $Group  = 0 #172
-$CdKey  = "33PXH-7Y6KF-2VJC9-XBBR8-HVTHH"
+$CdKey  = "GT63C-RJFQ3-4GMB6-BRFB9-CB83V"
 $Config = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
-$rawKey = [BinaryKey]::EncodeBinaryKey($CdKey)
-$xml    = [System.IO.File]::ReadAllBytes($Config)
+
+if ($Method -ne 'File') {
+  $rawKey = [BinaryKey]::EncodeBinaryKey($CdKey)
+}
+
+if ($Method -eq 'Xml') {
+  $xml = [System.IO.File]::ReadAllBytes($Config)
+}
+
+$ConfigPath  = '.\PKeyConfigs'
+#$ConfigPath = 'C:\Windows\System32\spp'
 
 # TO create new List
-#New-PkeyBinkIndex -Path '.\PKeyConfigs' | Out-Null
-$lists  = Get-PkeyBinkLists -ConfigPath ".\PKeyConfigs\binks.csv"
+#New-PkeyIndex -Path $ConfigPath | Out-Null
+
+
+if(-not $Global:lists) {
+  $Global:lists  = Get-PkeyBinkLists -ConfigPath "$ConfigPath\binks.csv"
+}
+if(-not $Global:ranges) {
+  $Global:ranges = [System.IO.File]::ReadAllText("$ConfigPath\ranges.csv", [System.Text.Encoding]::UTF8) | ConvertFrom-Csv
+}
+
+if(-not $Global:iid) {
+  $Global:iid = (Get-CimInstance -Query ("SELECT OfflineInstallationId FROM SoftwareLicensingProduct " +
+            "WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL") |
+            Select-Object -First 1).OfflineInstallationId
+}
+
 
 # VerifyBinks return codes (1 = valid, 0 = no match)
 $PkeyErrors = @{
@@ -1415,6 +1442,7 @@ $index    = -1
 $code     = $null
 $success  = $false
 $uidBytes = [byte[]]::new(8)
+
 $Dtimer   = [System.Diagnostics.Stopwatch]::StartNew()
 $Ctimer   = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -1460,10 +1488,9 @@ try {
 
 if ($success) {
     $serial = (([BitConverter]::ToUInt64($uidBytes, 0)) -shr 1) -band 0x3FFFFFFF
-    $ranges = [System.IO.File]::ReadAllText(".\PKeyConfigs\ranges.csv", [System.Text.Encoding]::UTF8) | ConvertFrom-Csv
     $Config = $ranges | Where-Object { [int]$_.Group -eq $group -and $serial -ge [int64]$_.Start -and $serial -le [int64]$_.End } | Select-Object -First 1
     if ($Config) {
-        Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath (Join-Path ".\PKeyConfigs" $Config.File)
+        Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath (Join-Path $ConfigPath $Config.File)
     } else {
         Get-PkeyInfo -Uid $uidBytes -Group $group -Skip
     }
@@ -1473,5 +1500,5 @@ if ($success) {
     Write-Host "`n[ X ] Invalid" -ForegroundColor DarkGray
 }
 $Ctimer.Stop()
-[String]::Format("Native call [{0}] took {1:N3} s ({2} ms)", $Method, $Dtimer.Elapsed.TotalSeconds, $Dtimer.ElapsedMilliseconds)
-[String]::Format("Total  call [{0}] took {1:N3} s ({2} ms)", $Method, $Ctimer.Elapsed.TotalSeconds, $Ctimer.ElapsedMilliseconds)
+[String]::Format("native call took {1:N3} s ({2} ms)", $Method, $Dtimer.Elapsed.TotalSeconds, $Dtimer.ElapsedMilliseconds)
+[String]::Format("Total  Time took {1:N3} s ({2} ms)", $Method, $Ctimer.Elapsed.TotalSeconds, $Ctimer.ElapsedMilliseconds)
