@@ -38,6 +38,35 @@ Same ????, now you can decrypt the binary, and you also have the << <pkc:GroupId
 
 # Structs
 <#
+
+** New Version
+typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
+    uint64_t  RefCount;                // 0x00  = 1 at build; atomic, freed at 0
+    wchar_t*  ProductIdStr;            // 0x08  "msft2005:{GUID}&{base64}"  (set by sub_180015728)
+    FILETIME  ValidationTime;          // 0x10
+    uint32_t  DataIdSequence;          // 0x18  full serial (int32)
+    uint32_t  _pad1c;                  // 0x1C
+    // ---- embedded key object (memset 0, then filled by populate) ----
+    //      the validator (sub_18008D85C) sees this sub-struct as keyObj, base = +0x20
+    uint32_t  GroupID;                 // 0x38  (keyObj+0x18)
+    uint32_t  SerialA;                 // 0x3C  channel   (keyObj+0x1C)
+    uint32_t  SerialB;                 // 0x40  sequence  (keyObj+0x20)
+    uint32_t  LicenseFlags;            // 0x44  bit0 = upgrade
+    uint64_t  Security;                // 0x48  (keyObj+0x28)
+    uint32_t  HaveRawKey;              // 0x50  = 1  (keyObj+0x30)
+    uint32_t  Solved;                  // 0x54  = 1 on success (keyObj+0x34)
+    uint8_t   RawKeyMaterial[16];      // 0x58  (keyObj+0x38)
+    uint8_t   Decoded_M[6];            // 0x68  (keyObj+0x48)  <- ExtractMBytes via TryCandidate r9
+    uint8_t   _padM[2];                // 0x6E
+    // ---- reserved tail: zero-initialized, never written in validate path ----
+    uint64_t  _reserved70;             // 0x70  == 0
+    uint64_t  _reserved78;             // 0x78  == 0  (and qword,0)
+    uint64_t  _reserved80;             // 0x80  == 0  (and qword,0)
+    uint64_t  _reserved88;             // 0x88  == 0  (and qword,0)
+    uint64_t  _reserved90;             // 0x90  == 0
+} PID_OBJ; 
+
+** Old Version
 typedef struct _MSFT_PKEY_DATA {
     uint64_t Reserved;             // 0x00 (0x20 relative to PID_OBJ)
     wchar_t* ProductIdStr;         // 0x08 -> Points to "msft2005:[GUID]&[Base64->MatrixAddress-0x68]"
@@ -51,7 +80,6 @@ typedef struct _MSFT_PKEY_DATA {
     uint32_t StatusFlag2;          // 0x34 (0x54) - Status/Mode value 2
     uint8_t  RawKeyMaterial[16];   // 0x38 (0x58) - RAW CD KEY Bytes  
 } MSFT_PKEY_DATA;                  // Total Size: 0x48 bytes (72 decimal)                   // Total Size: 0x48 bytes
-
 typedef struct _PID_OBJ {
     uint64_t        RefCount;          // 0x00
     wchar_t*        ProductIdStr;      // 0x08
@@ -59,7 +87,7 @@ typedef struct _PID_OBJ {
     uint32_t        DataIdSequence;    // 0x18, Serial Part, Full, As INT32
     uint32_t        AlignmentPadding;  // 0x1C
     MSFT_PKEY_DATA  Data;              // 0x20 - 0x68
-    void*    pPKeyConfig;              // 0x68 - XRM-MS matrix row
+    void*    Decoded_M;                // 0x68, sub_18008D85C->0x180087acc {TryCandidate --> sub_18008837C,sub_18008AAB4,sub_180090ADC --> ExtractMBytes} -> Inject back to thread
     void*    pKeyBits;                 // 0x70
     void*    pMetadata;                // 0x78
     uint64_t UnknownTail;              // 0x80
@@ -414,7 +442,7 @@ Free-IntPtr $v75Buffer -Method Auto
 Write-Host
 Write-Host "Re-manufacturing the 12-Byte Material Block..." -ForegroundColor Cyan
 
-# 1. Grab the live pointer sitting at row 0060, offset 0x68 (104 decimal)
+# Decoded M -> SOurce sub_180090ADC
 $ConfigRowPtr = [Marshal]::ReadIntPtr($HeapPtr, 104)
 
 if ($ConfigRowPtr -ne [IntPtr]::Zero) {
