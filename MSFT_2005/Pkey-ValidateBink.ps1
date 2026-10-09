@@ -900,20 +900,25 @@ namespace PkeyIid
 function Get-PkeyInfo {
     <#
     .SYNOPSIS
-        Decodes the PKEY2005 UID returned by PkeyLib64.dll, looks up the
-        matching configuration in pkeyconfig.xrm-ms, builds the ActString
-        and re-encodes an offline IID using the
-        HWID of the installed Windows product.
+        Decodes the PKEY2005 UID returned by PkeyLib, finds the matching
+        configuration + key range across ONE OR MORE pkeyconfig files, builds
+        the ActString and re-encodes an offline IID from the machine HWID.
 
         UID layout (https://github.com/UMSKT/writeups/blob/main/PKEY2005.md):
             upgrade : 1   | serial : 30   | auth : 10
+
+        -ConfigPath now takes a LIST of candidate files (e.g. every file
+        binks.csv lists for the group). The files are tried in order and the
+        first one whose <Configuration RefGroupId=Group> has a <KeyRange>
+        containing the serial wins. The chosen file is reported as ConfigFile.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][byte[]]$Uid,
-        [Parameter(Mandatory)][int]$Group,
-        [Parameter(Mandatory)][string]$ConfigPath,
-        [string]$ScriptDir = $PSScriptRoot
+        [byte[]]$Uid,
+        [int]$Group,
+        [string[]]$ConfigPath,
+        [string]$ScriptDir = $PSScriptRoot,
+        [switch]$Skip
     )
 
     # --- Decode UID bit fields ---------------------------------------------
@@ -922,23 +927,44 @@ function Get-PkeyInfo {
     $serial  = ($raw -shr 1)  -band 0x3FFFFFFF
     $auth    = ($raw -shr 31) -band 0x3FF
 
-    # --- Find Configuration + KeyRange for Group/Serial ---------------------
-    [xml]$xrm = Get-Content -LiteralPath $ConfigPath -Raw
-    $b64 = $xrm.SelectSingleNode("//*[local-name()='infoBin'][@name='pkeyConfigData']").InnerText
-    [xml]$pkey = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)).TrimStart([char]0xFEFF)
+    $get = { param($Node, $Name) $n = $Node.SelectSingleNode("*[local-name()='$Name']"); if ($n) { $n.InnerText.Trim() } else { $null } }
 
-    $get = { param($Node, $Name) $Node.SelectSingleNode("*[local-name()='$Name']").InnerText }
+    # inner pkeyConfigData bytes -> text, by BOM (UTF-16 LE / UTF-8)
+    $decode = {
+        param([byte[]]$b)
+        if ($b.Length -ge 2 -and $b[0] -eq 0xFF -and $b[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($b, 2, $b.Length - 2) }
+        if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { return [Text.Encoding]::UTF8.GetString($b, 3, $b.Length - 3) }
+        if ($b.Length -ge 2 -and $b[1] -eq 0) { return [Text.Encoding]::Unicode.GetString($b) }
+        return [Text.Encoding]::UTF8.GetString($b)
+    }
 
-    $cfg = $null; $range = $null; $actId = $null
-    foreach ($c in $pkey.SelectNodes("//*[local-name()='Configuration'][*[local-name()='RefGroupId']='$Group']")) {
-        $id = & $get $c 'ActConfigId'
-        $range = $pkey.SelectNodes("//*[local-name()='KeyRange'][*[local-name()='RefActConfigId']='$id']") |
-            Where-Object { $serial -ge [UInt64](& $get $_ 'Start') -and $serial -le [UInt64](& $get $_ 'End') } |
-            Select-Object -First 1
-        if ($range) { 
-            $cfg = $c; 
-            $actId = $id; 
-            break 
+    if (-not $Skip.IsPresent) {
+
+        # --- Find Configuration + KeyRange for Group/Serial, across the files ---
+        $cfg = $null; $range = $null; $actId = $null; $usedConfig = $null
+
+        foreach ($cp in $ConfigPath) {
+            if ([string]::IsNullOrWhiteSpace($cp) -or -not (Test-Path -LiteralPath $cp)) { continue }
+            try {
+                [xml]$xrm = Get-Content -LiteralPath $cp -Raw
+                $bin = $xrm.SelectSingleNode("//*[local-name()='infoBin'][@name='pkeyConfigData']")
+                if (-not $bin) { continue }
+                $bytes = [Convert]::FromBase64String(($bin.InnerText -replace '\s', ''))
+                [xml]$pkey = (& $decode $bytes).TrimStart([char]0xFEFF)
+            } catch { Write-Verbose "skip $cp : $($_.Exception.Message)"; continue }
+
+            foreach ($c in $pkey.SelectNodes("//*[local-name()='Configuration'][*[local-name()='RefGroupId']='$Group']")) {
+                $id = & $get $c 'ActConfigId'
+                if (-not $id) { continue }
+                foreach ($r in $pkey.SelectNodes("//*[local-name()='KeyRange'][*[local-name()='RefActConfigId']='$id']")) {
+                    $s = [uint64]0; $e = [uint64]0
+                    if (-not [uint64]::TryParse((& $get $r 'Start'), [ref]$s)) { continue }
+                    if (-not [uint64]::TryParse((& $get $r 'End'),   [ref]$e)) { continue }
+                    if ($serial -ge $s -and $serial -le $e) { $range = $r; break }
+                }
+                if ($range) { $cfg = $c; $actId = $id; break }
+            }
+            if ($range) { $usedConfig = $cp; break }
         }
     }
 
@@ -957,19 +983,13 @@ function Get-PkeyInfo {
             "WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL") |
             Select-Object -First 1).OfflineInstallationId
 
-    if (-not $hwid -and $iid) { 
-        try {
-          $hwid = Get-IidHwid $iid
-        } catch{}
+    if (-not $hwid -and $iid) {
+        try { $hwid = Get-IidHwid $iid } catch {}
     }
     if (-not $hwid) {
-      try {
-        $hwid = [String]::Format("0x{0}", [Convert]::ToString((Get-WinRTHwid), 16))
-      } catch {}
+        try { $hwid = [String]::Format("0x{0}", [Convert]::ToString((Get-WinRTHwid), 16)) } catch {}
     }
-    if ($hwid -eq $null) {
-      $hwid = '0'
-    }
+    if ($hwid -eq $null) { $hwid = '0' }
     $offlineAct = New-Iid2005 -Hwid $hwid -Security $auth -Group $Group -Serial $serial -Upgrade $upgrade
 
 # Tsforge Project
@@ -1028,6 +1048,8 @@ $GetExtendedPid = {
     )
 }
 
+    $eula = if ($range) { & $get $range 'EulaType' } else { 'Retail' }
+
     [pscustomobject]@{
         Upgrade     = $upgrade
         Serial      = $serial
@@ -1041,9 +1063,10 @@ $GetExtendedPid = {
         RangeValid  = if ($range) { (& $get $range 'IsValid') -eq 'true' } else { $null }
         ActString   = $actString
         BasePid     = & $GetPid -Serial $serial -Group $Group -EulaType $eula
-        ExtendedPID = & $GetExtendedPid -Serial $serial -Group $Group
+        ExtendedPID = & $GetExtendedPid -Serial $serial -Group $Group -EulaType $eula
         HWID        = $hwid
         OfflineAct  = $offlineAct
+        ConfigFile  = $usedConfig
     }
 }
 function Get-PkeyBinkLists {
@@ -1191,28 +1214,40 @@ function Get-PkeyBinkLists {
         BinkSize  = $binkSize
     }
 }
-function New-PkeyBinkIndex {
+function New-PkeyIndex {
     <#
     .SYNOPSIS
-        Scans a folder of pkeyconfig files and writes binks.csv
-        (GroupId, Bink, Files) into that folder. Self-contained: copy this
-        one function anywhere. Windows PowerShell 5.1+ (Windows 7 SP1+).
+        Scans a folder of pkeyconfig files and writes TWO csv files into it:
+          binks.csv   GroupId, Bink, Files      (file(s) holding bink + range)
+          ranges.csv  Group, Start, End, File    (ONE ROW PER KEY RANGE)
+        One pass: each file is parsed once. Self-contained.
+        Windows PowerShell 5.1+ (Windows 7 SP1+).
     .EXAMPLE
-        New-PkeyBinkIndex C:\PKeyConfigs                 # recurse, writes C:\PKeyConfigs\binks.csv
-        New-PkeyBinkIndex C:\PKeyConfigs -NoRecurse
-        New-PkeyBinkIndex C:\PKeyConfigs -OutFile D:\binks.csv
+        New-PkeyIndex C:\PKeyConfigs                 # -> binks.csv + ranges.csv
+        New-PkeyIndex C:\PKeyConfigs -NoRecurse
+        New-PkeyIndex C:\PKeyConfigs -BinksOut D:\b.csv -RangesOut D:\r.csv
     .DESCRIPTION
-        A group is written only when ONE file holds its Bink, a configuration
-        pointing to it and key ranges for that configuration. Files without
-        such a group are ignored. Each GroupId appears once (first file wins).
-        Paths are stored relative to the CSV's folder, so it can be moved.
+        binks.csv: a group is written only when ONE file holds its Bink, a
+        configuration pointing to it and a key range for that configuration.
+        Each GroupId appears once (first file wins). Lets Get-PkeyBinkLists
+        build the batched lists for VerifyBinks.
+
+        ranges.csv: every msft2005 key range, with its serial bounds and the
+        file it lives in. Resolve a validated key with ONE lookup, no loop:
+            Group = g AND Start <= serial <= End  ->  row.File
+        Ranges may live in files that don't hold the bink, so a group can have
+        range rows across several files. Identical (Group,Start,End) ranges are
+        written once (first file kept).
+
+        Paths are relative to each csv's folder, so the folder can be moved.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true, Position = 0)][string]$Path,
         [switch]$NoRecurse,
         [string[]]$Include = @('*.xrm-ms', '*.xml'),
-        [string]$OutFile
+        [string]$BinksOut,
+        [string]$RangesOut
     )
     $ErrorActionPreference = 'Stop'
     Set-StrictMode -Version 2.0
@@ -1224,150 +1259,122 @@ function New-PkeyBinkIndex {
         if ($null -eq $n) { return $null }
         $n.InnerText.Trim()
     }
-
     function ConvertFrom-ConfigBytes([byte[]]$Bytes) {
-        if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
-            return [Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2)
-        }
-        if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
-            return [Text.Encoding]::UTF8.GetString($Bytes, 3, $Bytes.Length - 3)
-        }
-        if ($Bytes.Length -ge 2 -and $Bytes[1] -eq 0) {
-            return [Text.Encoding]::Unicode.GetString($Bytes)
-        }
+        if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($Bytes, 2, $Bytes.Length - 2) }
+        if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) { return [Text.Encoding]::UTF8.GetString($Bytes, 3, $Bytes.Length - 3) }
+        if ($Bytes.Length -ge 2 -and $Bytes[1] -eq 0) { return [Text.Encoding]::Unicode.GetString($Bytes) }
         [Text.Encoding]::UTF8.GetString($Bytes)
     }
-
-    function New-XmlDoc {
-        $d = New-Object System.Xml.XmlDocument
-        $d.XmlResolver = $null                 # never fetch external DTDs/entities
-        ,$d
-    }
-
-    # file -> <ProductKeyConfiguration> document, or $null
+    function New-XmlDoc { $d = New-Object System.Xml.XmlDocument; $d.XmlResolver = $null; ,$d }
     function Read-PkeyDoc([string]$File) {
         $doc = New-XmlDoc
-        try { $doc.Load($File) }
-        catch { Write-Verbose "Skip (not XML): $File"; return $null }
-
+        try { $doc.Load($File) } catch { Write-Verbose "Skip (not XML): $File"; return $null }
         if ($doc.DocumentElement.LocalName -eq 'ProductKeyConfiguration') { return ,$doc }
-
         $bin = $doc.SelectSingleNode("//*[local-name()='infoBin' and @name='pkeyConfigData']")
         if ($null -eq $bin) { Write-Verbose "Skip (no pkeyConfigData): $File"; return $null }
         try {
             $bytes = [Convert]::FromBase64String(($bin.InnerText -replace '\s', ''))
             $text  = (ConvertFrom-ConfigBytes $bytes).TrimStart([char]0xFEFF)
-            $inner = New-XmlDoc
-            $inner.LoadXml($text)
-        } catch {
-            Write-Warning "Cannot decode pkeyConfigData in $File : $($_.Exception.Message)"
-            return $null
-        }
-        if ($inner.DocumentElement.LocalName -ne 'ProductKeyConfiguration') {
-            Write-Verbose "Skip (unexpected root): $File"; return $null
-        }
+            $inner = New-XmlDoc; $inner.LoadXml($text)
+        } catch { Write-Warning "Cannot decode pkeyConfigData in $File : $($_.Exception.Message)"; return $null }
+        if ($inner.DocumentElement.LocalName -ne 'ProductKeyConfiguration') { Write-Verbose "Skip (unexpected root): $File"; return $null }
         ,$inner
     }
 
-    # complete msft2005 groups of ONE file: {GroupId, Bink}
-    function Get-FileGroups($Doc, [string]$File) {
+    # one file -> { Binks = @{group=base64}; Ranges = @( {Group;Start;End} ) }
+    function Get-FileData($Doc) {
         $binks = @{}
         foreach ($pk in $Doc.SelectNodes("//*[local-name()='PublicKeys']/*[local-name()='PublicKey']")) {
             if ((Get-ChildText $pk 'AlgorithmId') -ne $Algo2005) { continue }
             $gid = 0
             if (-not [int]::TryParse((Get-ChildText $pk 'GroupId'), [ref]$gid)) { continue }
-            if (-not $binks.ContainsKey($gid)) {
-                $binks[$gid] = (Get-ChildText $pk 'PublicKeyValue') -replace '\s', ''
-            }
+            if (-not $binks.ContainsKey($gid)) { $binks[$gid] = (Get-ChildText $pk 'PublicKeyValue') -replace '\s', '' }
         }
-        if ($binks.Count -eq 0) { return @() }
-
-        $hasRange = @{}
-        foreach ($r in $Doc.SelectNodes("//*[local-name()='KeyRanges']/*[local-name()='KeyRange']")) {
-            $id = Get-ChildText $r 'RefActConfigId'
-            if ($id) { $hasRange[$id] = $true }
-        }
-        $groupOk = @{}
+        # config id -> group id
+        $cfgGroup = @{}
         foreach ($c in $Doc.SelectNodes("//*[local-name()='Configurations']/*[local-name()='Configuration']")) {
             $id = Get-ChildText $c 'ActConfigId'
-            if ([string]::IsNullOrEmpty($id) -or -not $hasRange.ContainsKey($id)) { continue }
+            if ([string]::IsNullOrEmpty($id)) { continue }
             $gid = 0
-            if (-not [int]::TryParse((Get-ChildText $c 'RefGroupId'), [ref]$gid)) { continue }
-            if ($binks.ContainsKey($gid)) { $groupOk[$gid] = $true }
+            if ([int]::TryParse((Get-ChildText $c 'RefGroupId'), [ref]$gid)) { $cfgGroup[$id] = $gid }
         }
-
-        $out = foreach ($gid in ($binks.Keys | Sort-Object)) {
-            if (-not $groupOk.ContainsKey($gid)) {
-                Write-Verbose "  group $gid in $File has no configuration with ranges -> ignored"
-                continue
-            }
-            [pscustomobject]@{ GroupId = $gid; Bink = $binks[$gid] }
+        # one record per KeyRange
+        $ranges = New-Object System.Collections.ArrayList
+        foreach ($r in $Doc.SelectNodes("//*[local-name()='KeyRanges']/*[local-name()='KeyRange']")) {
+            $id = Get-ChildText $r 'RefActConfigId'
+            if (-not $id -or -not $cfgGroup.ContainsKey($id)) { continue }
+            $s = [long]0; $e = [long]0
+            if (-not [long]::TryParse((Get-ChildText $r 'Start'), [ref]$s)) { continue }
+            if (-not [long]::TryParse((Get-ChildText $r 'End'),   [ref]$e)) { continue }
+            [void]$ranges.Add([pscustomobject]@{ Group = $cfgGroup[$id]; Start = $s; End = $e })
         }
-        @($out)
+        [pscustomobject]@{ Binks = $binks; Ranges = $ranges }
     }
 
     function ConvertTo-RelPath([string]$FullPath, [string]$BaseDir) {
         $base = $BaseDir.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
-        if ($FullPath.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) {
-            return $FullPath.Substring($base.Length)
-        }
+        if ($FullPath.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { return $FullPath.Substring($base.Length) }
         $FullPath
     }
 
-    # -------------------------------------------------------------- build ---
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-        throw "Folder not found: $Path"
-    }
+    # -------------------------------------------------------------- scan ---
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "Folder not found: $Path" }
     $files = @(Get-ChildItem -LiteralPath $Path -Recurse:(-not $NoRecurse) -Force |
-               Where-Object {
-                   if ($_.PSIsContainer) { return $false }
-                   foreach ($p in $Include) { if ($_.Name -like $p) { return $true } }
-                   $false
-               } | Sort-Object FullName)
+               Where-Object { if ($_.PSIsContainer) { return $false }; foreach ($p in $Include) { if ($_.Name -like $p) { return $true } }; $false } |
+               Sort-Object FullName)
 
-    $index = @{}
+    if (-not $BinksOut)  { $BinksOut  = Join-Path $Path 'binks.csv' }
+    if (-not $RangesOut) { $RangesOut = Join-Path $Path 'ranges.csv' }
+    $binksFull  = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BinksOut)
+    $rangesFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RangesOut)
+    $binksDir   = [IO.Path]::GetDirectoryName($binksFull)
+    $rangesDir  = [IO.Path]::GetDirectoryName($rangesFull)
+
+    $binkIndex = @{}                          # group -> @{ Bink; Files(ArrayList) }
+    $rangeRows = New-Object System.Collections.ArrayList
+    $seenRange = @{}                          # "group|start|end" -> $true
     $used = 0; $ignored = 0
+
     foreach ($f in $files) {
         $doc = Read-PkeyDoc $f.FullName
         if ($null -eq $doc) { $ignored++; continue }
-        $groups = @(Get-FileGroups $doc $f.FullName)
-        if ($groups.Count -eq 0) {
-            Write-Verbose "Ignored (no msft2005 group with Bink + ranges): $($f.FullName)"
-            $ignored++; continue
+        $data = Get-FileData $doc
+        $relRange = ConvertTo-RelPath $f.FullName $rangesDir
+
+        # ranges: one row per unique (group,start,end), remembering the file
+        $groupsWithRange = @{}
+        foreach ($r in $data.Ranges) {
+            $groupsWithRange[$r.Group] = $true
+            $key = '{0}|{1}|{2}' -f $r.Group, $r.Start, $r.End
+            if ($seenRange.ContainsKey($key)) { continue }
+            $seenRange[$key] = $true
+            [void]$rangeRows.Add([pscustomobject]@{ Group = $r.Group; Start = $r.Start; End = $r.End; File = $relRange })
         }
+
+        # binks: a group counts only when its bink AND a range are both here
+        $complete = @($data.Binks.Keys | Where-Object { $groupsWithRange.ContainsKey($_) } | Sort-Object)
+        if ($complete.Count -eq 0) { Write-Verbose "No complete group (bink + range) in: $($f.FullName)"; $ignored++; continue }
         $used++
-        foreach ($g in $groups) {
-            if (-not $index.ContainsKey($g.GroupId)) {
-                $index[$g.GroupId] = @{ Bink = $g.Bink; Files = (New-Object System.Collections.ArrayList) }
-            } elseif ($index[$g.GroupId].Bink -ne $g.Bink) {
-                Write-Warning "Group $($g.GroupId): different Bink in $($f.FullName); keeping the first, file not listed"
-                continue
-            }
-            [void]$index[$g.GroupId].Files.Add($f.FullName)
+        foreach ($gid in $complete) {
+            if (-not $binkIndex.ContainsKey($gid)) { $binkIndex[$gid] = @{ Bink = $data.Binks[$gid]; Files = (New-Object System.Collections.ArrayList) } }
+            elseif ($binkIndex[$gid].Bink -ne $data.Binks[$gid]) { Write-Warning "Group $gid : different Bink in $($f.FullName); keeping the first, file not listed"; continue }
+            [void]$binkIndex[$gid].Files.Add((ConvertTo-RelPath $f.FullName $binksDir))
         }
     }
 
-    if (-not $OutFile) { $OutFile = Join-Path $Path 'binks.csv' }
-    $outFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
-    $outDir  = [IO.Path]::GetDirectoryName($outFull)
+    # -------------------------------------------------------------- binks.csv ---
+    $groups = @($binkIndex.Keys | Sort-Object)
+    $binkRows = @(foreach ($gid in $groups) { [pscustomobject]@{ GroupId = $gid; Bink = $binkIndex[$gid].Bink; Files = ($binkIndex[$gid].Files -join '|') } })
+    if ($binkRows.Count -gt 0) { $binkRows | Export-Csv -LiteralPath $binksFull -NoTypeInformation -Encoding UTF8 }
+    else { [IO.File]::WriteAllText($binksFull, '"GroupId","Bink","Files"' + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($true))); Write-Warning "No complete msft2005 group found in $Path (empty binks.csv written)" }
+    Write-Host "Binks index written:  $binksFull ($($binkRows.Count) groups)"
 
-    $rows = @(foreach ($gid in ($index.Keys | Sort-Object)) {
-        $rel = @($index[$gid].Files | ForEach-Object { ConvertTo-RelPath $_ $outDir })
-        [pscustomobject]@{ GroupId = $gid; Bink = $index[$gid].Bink; Files = ($rel -join '|') }
-    })
-
-    Write-Verbose ("Files: {0} total, {1} used, {2} ignored. Unique groups: {3}" -f
-                   $files.Count, $used, $ignored, $rows.Count)
-
-    if ($rows.Count -gt 0) {
-        $rows | Export-Csv -LiteralPath $outFull -NoTypeInformation -Encoding UTF8
-    } else {
-        [IO.File]::WriteAllText($outFull, '"GroupId","Bink","Files"' + [Environment]::NewLine,
-                                (New-Object System.Text.UTF8Encoding($true)))
-        Write-Warning "No complete msft2005 group found in $Path (empty index written)"
-    }
-    Write-Host "Index written: $outFull ($($rows.Count) groups)"
-    $rows
+    # -------------------------------------------------------------- ranges.csv ---
+    $outRanges = @($rangeRows | Sort-Object Group, Start)
+    if ($outRanges.Count -gt 0) { $outRanges | Export-Csv -LiteralPath $rangesFull -NoTypeInformation -Encoding UTF8 }
+    else { [IO.File]::WriteAllText($rangesFull, '"Group","Start","End","File"' + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($true))); Write-Warning "No msft2005 ranges found in $Path" }
+    $groupsCovered = @($outRanges | Group-Object Group).Count
+    Write-Host "Range index written:  $rangesFull ($($outRanges.Count) ranges over $groupsCovered groups)"
 }
 #endregion
 
@@ -1383,7 +1390,7 @@ $Method = 'Binks'
 
 # Base Input
 $Group  = 0 #172
-$CdKey  = "RHTBY-VWY6D-QJRJ9-JGQ3X-Q2289"
+$CdKey  = "33PXH-7Y6KF-2VJC9-XBBR8-HVTHH"
 $Config = Join-Path $PSScriptRoot "pkeyconfig.xrm-ms"
 $rawKey = [BinaryKey]::EncodeBinaryKey($CdKey)
 $xml    = [System.IO.File]::ReadAllBytes($Config)
@@ -1408,7 +1415,8 @@ $index    = -1
 $code     = $null
 $success  = $false
 $uidBytes = [byte[]]::new(8)
-$timer    = [System.Diagnostics.Stopwatch]::StartNew()
+$Dtimer   = [System.Diagnostics.Stopwatch]::StartNew()
+$Ctimer   = [System.Diagnostics.Stopwatch]::StartNew()
 
 try {
     switch ($Method) {
@@ -1447,18 +1455,23 @@ try {
     }
 
 } finally {
-    $timer.Stop()
+    $Dtimer.Stop()
 }
 
 if ($success) {
-    $Configs = (([System.IO.File]::ReadAllText(".\PKeyConfigs\binks.csv", [System.Text.Encoding]::UTF8) |
-        ConvertFrom-Csv | ? GroupId -eq $group |
-        select -ExpandProperty Files) -split '\|')
-    $Config = Join-Path ".\PKeyConfigs" ($Configs | select -Last 1)
-    Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath $Config
+    $serial = (([BitConverter]::ToUInt64($uidBytes, 0)) -shr 1) -band 0x3FFFFFFF
+    $ranges = [System.IO.File]::ReadAllText(".\PKeyConfigs\ranges.csv", [System.Text.Encoding]::UTF8) | ConvertFrom-Csv
+    $Config = $ranges | Where-Object { [int]$_.Group -eq $group -and $serial -ge [int64]$_.Start -and $serial -le [int64]$_.End } | Select-Object -First 1
+    if ($Config) {
+        Get-PkeyInfo -Uid $uidBytes -Group $group -ConfigPath (Join-Path ".\PKeyConfigs" $Config.File)
+    } else {
+        Get-PkeyInfo -Uid $uidBytes -Group $group -Skip
+    }
 } elseif ($null -ne $code -and $code -lt 0) {
     Write-Host ("`n[ ! ] VerifyBinks error {0}: {1}" -f $code, $PkeyErrors[$code]) -ForegroundColor Red
 } else {
     Write-Host "`n[ X ] Invalid" -ForegroundColor DarkGray
 }
-[String]::Format("DLL call [{0}] took {1:N3} s ({2} ms)", $Method, $timer.Elapsed.TotalSeconds, $timer.ElapsedMilliseconds)
+$Ctimer.Stop()
+[String]::Format("Native call [{0}] took {1:N3} s ({2} ms)", $Method, $Dtimer.Elapsed.TotalSeconds, $Dtimer.ElapsedMilliseconds)
+[String]::Format("Total  call [{0}] took {1:N3} s ({2} ms)", $Method, $Ctimer.Elapsed.TotalSeconds, $Ctimer.ElapsedMilliseconds)
