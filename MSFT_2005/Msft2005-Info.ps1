@@ -337,10 +337,10 @@ $Address = [Marshal]::ReadIntPtr($tmpPtr)
 
 $CfgPtr = [Marshal]::StringToHGlobalUni($CfgPath)
 $func2  = [NativeInterop]::GetTargetAddress($hModule, 0x18000C970)
-[Marshal]::FreeHGlobal($CfgPtr)
 
 Write-Host "Loading 7601 Configuration Rules..." -ForegroundColor Cyan
 $hr = [NativeInterop]::Call($func2, $Address.ToInt64(), $CfgPtr, 0L, 0L)
+[Marshal]::FreeHGlobal($CfgPtr)
 Write-Host "Loader Return HRESULT: 0x$($hr.ToString('X'))`n"
 
 # ==========================================
