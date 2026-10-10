@@ -518,6 +518,7 @@ $BinkList | % {
             Write-Host ('Channel      : {0:D3}' -f $channel)
             Write-Host ('Sequence     : {0:D6}' -f $sequence)
             Write-Host ('out A / out B: 0x{0:X8} / 0x{1:X8}' -f $outA, $outB)
+            Write-Host
 
             break
 
