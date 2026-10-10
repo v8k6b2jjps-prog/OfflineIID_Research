@@ -32,19 +32,6 @@ Copy Dll To Release Folder
 #define FORCE_INLINE inline __attribute__((always_inline))
 #endif
 
-// The Fp3/Fp6 multiply and square bodies are large: one Fp6 multiply is 18
-// two-limb products plus 6 reductions. On x64 / ARM64 that is compact enough
-// to inline everywhere. On 32-bit x86 every 64-bit step becomes several
-// instructions, and inlining a copy at each call site made PkeyLib32.dll
-// about 3x the size of the other builds. There the bodies are kept as ONE
-// shared function each; a call costs nothing next to the ~400 multiplies
-// inside. Define PKEY_INLINE_BIG to get the old inline-everywhere behaviour.
-#if defined(_MSC_VER) && defined(_M_IX86) && !defined(PKEY_INLINE_BIG)
-#define PKEY_BIG_FN __declspec(noinline)
-#else
-#define PKEY_BIG_FN FORCE_INLINE
-#endif
-
 // Same gate the scalar Fpm::Mul already uses for its ADX/ADCX-ADOX path.
 // When set, the lazy Fp3/Fp6 accumulators (addmul2 / RedcWide) -- the inner
 // loop of the MITM's 93% -- also use _mulx_u64 + dual (ADCX/ADOX) carry
@@ -144,26 +131,6 @@ public:
         return (mid << 32) | (uint32_t)p0;
 #endif
     }
-#if defined(_M_IX86)
-    // x86: two chained 32-bit ADC / SBB. The compare-based version below makes
-    // the 32-bit compiler emit a compare-and-branch pair for every carry, and
-    // carries are data dependent, so those branches also predict badly.
-    // _addcarry_u32 / _subborrow_u32 are plain ADC / SBB: any x86 CPU runs them.
-    FORCE_INLINE static unsigned char Adc64(unsigned char cin, uint64_t a, uint64_t b, uint64_t& out) {
-        unsigned int lo, hi;
-        unsigned char c = _addcarry_u32(cin, (unsigned int)a, (unsigned int)b, &lo);
-        c = _addcarry_u32(c, (unsigned int)(a >> 32), (unsigned int)(b >> 32), &hi);
-        out = ((uint64_t)hi << 32) | lo;
-        return c;
-    }
-    FORCE_INLINE static unsigned char Sbb64(unsigned char bin, uint64_t a, uint64_t b, uint64_t& out) {
-        unsigned int lo, hi;
-        unsigned char c = _subborrow_u32(bin, (unsigned int)a, (unsigned int)b, &lo);
-        c = _subborrow_u32(c, (unsigned int)(a >> 32), (unsigned int)(b >> 32), &hi);
-        out = ((uint64_t)hi << 32) | lo;
-        return c;
-    }
-#else
     FORCE_INLINE static unsigned char Adc64(unsigned char cin, uint64_t a, uint64_t b, uint64_t& out) {
         uint64_t s = a + b;
         unsigned char c1 = s < a;
@@ -181,7 +148,6 @@ public:
         out = r;
         return b1 | b2;
     }
-#endif
 #endif
 #else
     FORCE_INLINE static uint64_t MulWide64(uint64_t a, uint64_t b, uint64_t& hi) {
@@ -562,7 +528,7 @@ public:
         }
         return Fpx::Make(r0,r1);
     }
-    PKEY_BIG_FN static Fp3m Mul3Lazy(const Fp3m& A,const Fp3m& B){
+    FORCE_INLINE static Fp3m Mul3Lazy(const Fp3m& A,const Fp3m& B){
         const uint64_t a0=A.C0.A0,a0h=A.C0.A1,a1=A.C1.A0,a1h=A.C1.A1,a2=A.C2.A0,a2h=A.C2.A1;
         const uint64_t b0=B.C0.A0,b0h=B.C0.A1,b1=B.C1.A0,b1h=B.C1.A1,b2=B.C2.A0,b2h=B.C2.A1;
         uint64_t A01,A01h,B01,B01h,A02,A02h,B02,B02h,A12,A12h,B12,B12h; unsigned char cc;
@@ -608,7 +574,7 @@ public:
         w4copy(POS[1],M01); w4copy(NEG[1],d0);w4add(NEG[1],M12); w4copy(t,d2);w4muls(t,3);w4add(NEG[1],t);
         w4copy(POS[2],M02);w4add(POS[2],d1); w4copy(NEG[2],d0); w4copy(t,d2);w4muls(t,2);w4add(NEG[2],t);
     }
-    PKEY_BIG_FN static Fp6m Mul6Full(const Fp6m& a,const Fp6m& b){
+    FORCE_INLINE static Fp6m Mul6Full(const Fp6m& a,const Fp6m& b){
         Fp3m sA,sB;
         sA.C0=Fpm::Add(a.R.C0,a.I.C0);sA.C1=Fpm::Add(a.R.C1,a.I.C1);sA.C2=Fpm::Add(a.R.C2,a.I.C2);
         sB.C0=Fpm::Add(b.R.C0,b.I.C0);sB.C1=Fpm::Add(b.R.C1,b.I.C1);sB.C2=Fpm::Add(b.R.C2,b.I.C2);
@@ -647,7 +613,7 @@ public:
         w4copy(POS[1],M01); w4copy(NEG[1],d0);w4add(NEG[1],M12); w4copy(t,d2);w4muls(t,3);w4add(NEG[1],t);
         w4copy(POS[2],M02);w4add(POS[2],d1); w4copy(NEG[2],d0); w4copy(t,d2);w4muls(t,2);w4add(NEG[2],t);
     }
-    PKEY_BIG_FN static Fp6m Sqr6Full(const Fp6m& a){
+    FORCE_INLINE static Fp6m Sqr6Full(const Fp6m& a){
         Fp3m sA;
         sA.C0=Fpm::Add(a.R.C0,a.I.C0);sA.C1=Fpm::Add(a.R.C1,a.I.C1);sA.C2=Fpm::Add(a.R.C2,a.I.C2);
         W4 P0[3],N0[3],P1[3],N1[3],Pc[3],Nc[3];
@@ -665,7 +631,7 @@ public:
         }
         return r;
     }
-    PKEY_BIG_FN static Fp3m Sqr3(const Fp3m& a){ W4 P[3],N[3]; Sqr3Wide(a,P,N);
+    FORCE_INLINE static Fp3m Sqr3(const Fp3m& a){ W4 P[3],N[3]; Sqr3Wide(a,P,N);
         const W4 BIAS=*reinterpret_cast<const W4*>(Fpm::BIASW); Fp3m r; W4 ac;
         w4copy(ac,BIAS); w4add(ac,P[0]); w4sub(ac,N[0]); r.C0=RedcWide(ac);
         w4copy(ac,BIAS); w4add(ac,P[1]); w4sub(ac,N[1]); r.C1=RedcWide(ac);
