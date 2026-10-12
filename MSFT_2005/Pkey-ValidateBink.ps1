@@ -6,8 +6,12 @@ using namespace System.Runtime.InteropServices
 param(
     [string]$CDKey,
     [string]$Config,
+    [string]$ConfigPath = (Join-Path $PSScriptRoot '\PKeyConfigs'),
     [int]$Threads = 0,
-    [switch]$FromParent
+    [switch]$FromParent,
+
+    [ValidateSet('PidGenX','PkeyLib')]
+    [string]$RunAs = 'PidGenX'
 )
 
 # List of Source, not by order
@@ -972,6 +976,50 @@ class BinaryKey {
 }
 #endregion
 #region Helpers
+function New-PkeyIndex {
+    <#
+    .SYNOPSIS
+        Scans a folder of pkeyconfig files and writes an index.
+        Defaults to JSON format (calls New-PkeyIndex-JS), but supports CSV via -Format.
+    .EXAMPLE
+        New-PkeyIndex C:\PKeyConfigs                     # -> defaults to JSON
+        New-PkeyIndex C:\PKeyConfigs -Format CSV         # -> calls CSV function
+        New-PkeyIndex C:\PKeyConfigs -Gzip               # -> JSON with Gzip
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$Path,
+        [switch]$NoRecurse,
+        [string[]]$Include = @('*.xrm-ms', '*.xml'),
+        [ValidateSet('JSON', 'CSV')]
+        [string]$Format = 'JSON',
+        [string]$Out,
+        [string]$BinksOut,
+        [string]$RangesOut,
+        [switch]$Gzip
+    )
+
+    if ($Format -eq 'CSV') {
+        # Forward parameters to your CSV function
+        $csvParams = @{ Path = $Path }
+        if ($NoRecurse) { $csvParams['NoRecurse'] = $true }
+        if ($PSBoundParameters.ContainsKey('Include')) { $csvParams['Include'] = $Include }
+        if ($BinksOut) { $csvParams['BinksOut'] = $BinksOut }
+        if ($RangesOut) { $csvParams['RangesOut'] = $RangesOut }
+
+        New-PkeyIndex-CSV @csvParams
+    } 
+    else {
+        # Forward parameters to your JSON function (Default)
+        $jsParams = @{ Path = $Path }
+        if ($NoRecurse) { $jsParams['NoRecurse'] = $true }
+        if ($PSBoundParameters.ContainsKey('Include')) { $jsParams['Include'] = $Include }
+        if ($Out) { $jsParams['Out'] = $Out }
+        if ($Gzip) { $jsParams['Gzip'] = $true }
+
+        New-PkeyIndex-JS @jsParams
+    }
+}
 function New-PkeyIndex-CSV {
     <#
     .SYNOPSIS
@@ -1732,12 +1780,11 @@ function Search-Keys($Fn, $entries, [byte[]]$key16, [int]$threads) {
     else { [pscustomobject]@{ Valid = $false; Upgrade = $null; Serial = $null; Security = $null; GroupId = $null } }
 }
 #endregion
-
+#region Add-Type
 # x86, x64, Arm x64 Block's
 if ($Is32Bit) {
   Restore-Util
 }
-
 if (!([PSTypeName]'PkeyNative').Type) {
 Add-Type -TypeDefinition @'
 using System;
@@ -1814,6 +1861,77 @@ public static class PkeyNativeArm64 {
 }
 '@
 }
+if (!([PSTypeName]'PKeyInnerInterop').Type) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.ExceptionServices;
+using System.Security;
+
+public static class PKeyInnerInterop {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern IntPtr LoadLibrary(string dllToLoad);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate int InnerDelegate(IntPtr keyObj, IntPtr blob, int blobSize, IntPtr reserved);
+
+    [HandleProcessCorruptedStateExceptions]
+    [SecurityCritical]
+    public static int SafeInvoke(IntPtr fn, IntPtr keyObj, IntPtr blob, int blobSize, out int status) {
+        status = 0;
+        try {
+            var f = (InnerDelegate)Marshal.GetDelegateForFunctionPointer(fn, typeof(InnerDelegate));
+            return f(keyObj, blob, blobSize, IntPtr.Zero);
+        }
+        catch (AccessViolationException) { status = 1; return unchecked((int)0xC0000005); }
+        catch (SEHException)             { status = 2; return unchecked((int)0xC0000006); }
+        catch (Exception)                { status = 3; return unchecked((int)0xDEAD0003); }
+    }
+}
+"@ -ErrorAction Stop
+}
+function Invoke-PkeyInner {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][byte[]]$KeyData,   # 16 key bytes
+        [Parameter(Mandatory)][byte[]]$Bink,      # raw bink blob
+        [string]$DllPath   = (Join-Path $PSScriptRoot 'pidgenx64.dll'),
+        [string]$FnOffset  = '0x18008D85C',
+        [string]$ImageBase = '0x180000000'
+    )
+
+    $hModule = [PKeyInnerInterop]::LoadLibrary($DllPath)
+    if ($hModule -eq [IntPtr]::Zero) { throw "Failed to load library: $DllPath" }
+    $fnPtr = [IntPtr]::Add($hModule,
+                [Convert]::ToInt64($FnOffset,16) - [Convert]::ToInt64($ImageBase,16))
+
+    $KeyObjBytes       = [byte[]]::new(96)
+    $KeyObjBytes[0x30] = 1
+    [Array]::Copy($KeyData, 0, $KeyObjBytes, 0x38, 16)
+
+    $KeyObj  = [Marshal]::AllocHGlobal(96)
+    $BinkObj = [Marshal]::AllocHGlobal($Bink.Length)
+    try {
+        [Marshal]::Copy($KeyObjBytes, 0, $KeyObj, 96)
+        [Marshal]::Copy($Bink, 0, $BinkObj, $Bink.Length)
+
+        $status = 0
+        $hr = [PKeyInnerInterop]::SafeInvoke($fnPtr, $KeyObj, $BinkObj, $Bink.Length, [ref]$status)
+
+        [pscustomobject]@{
+            Ok      = ($status -eq 0 -and $hr -eq 0)
+            Faulted = ($status -ne 0)
+            Status  = $status
+            Hr      = $hr
+            M       = if ($status -eq 0 -and $hr -eq 0) { [Marshal]::ReadInt64($KeyObj, 0x48) } else { $null }
+        }
+    }
+    finally {
+        [Marshal]::FreeHGlobal($KeyObj)
+        [Marshal]::FreeHGlobal($BinkObj)
+    }
+}
+#endregion
 
 # Wrapper for this process: x86 -> PkeyLib32.dll, x64 -> PkeyLib64.dll, ARM64 -> PkeyLibA64.dll.
 # Every native call below goes through $PkeyLib, so all three share one code path.
@@ -1832,29 +1950,29 @@ if(-not $Global:iid) {
             Select-Object -First 1).OfflineInstallationId
 }
 
-
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
 
 # Which export to call
 #   'File'  = VerifyKey        (key text + config path, always scans every group)   needs -Config
-#   'Xml'   = VerifyBinaryKey  (raw key + config bytes)                              needs -Config
-#   'Binks' = VerifyBinks      (raw key + group list + bink list)                    uses the index in $ConfigPath
+#   'Xml'   = VerifyBinaryKey  (raw key + config bytes)                             needs -Config
+#   'Binks' = VerifyBinks      (raw key + group list + bink list)                   uses the index in $ConfigPath
 $Method = 'Binks'
 
 # Group to test, 0 = every group ('Xml' and 'Binks')
 $TargetGroup = 0
 
-# Base Input
-$ConfigPath  = '.\PKeyConfigs'
-#$ConfigPath = 'C:\Windows\System32\spp'
+if ($Method -eq 'Binks') {
+    if (-not [System.Io.File]::Exists((Join-Path $ConfigPath "pkeyindex.json"))) {
+      New-PkeyIndex -Path $ConfigPath -Format JSON | Out-Null
+    }
+}
 
-# TO create new List
-#New-PkeyIndex -Path $ConfigPath | Out-Null
-
-
+# ------------------------------------------------------------
 # --- Execution Flow ---
+# ------------------------------------------------------------
+
 if ('File', 'Xml', 'Binks' -notcontains $Method) { throw "Unknown `$Method '$Method' (use File, Xml or Binks)" }
 if (-not $CDKey) { throw 'Provide -CDKey (25 characters).' }
 if ($Method -ne 'Binks') {
@@ -1894,6 +2012,7 @@ $PkeyErrors = @{
 $group    = 0
 $index    = -1
 $code     = $null
+$lastHr   = $null
 $success  = $false
 $uidBytes = [byte[]]::new(8)
 
