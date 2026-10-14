@@ -1800,11 +1800,11 @@ $managedBytes = New-Object Byte[] 13
 [Marshal]::Copy($ActPtr, $managedBytes, 0, 13)
 
 Write-Host "`n--- Raw Material Structure (Before Base64) ---" -ForegroundColor Green
-Format-HexView -Data $managedBytes -Mode 4x
+Format-HexView -Data $managedBytes -Mode 8x
 
 $base64String = [Convert]::ToBase64String($managedBytes)
 Write-Host
-Write-Host "--- Base64 Encoded Result ---" -ForegroundColor Cyan
+Write-Host "--- Base64 Encoded Result * Raw ---" -ForegroundColor Cyan
 Write-Host $base64String
 # -> AAAAgF4GeGd7i+f+Ew==
 
@@ -1820,12 +1820,38 @@ $act_hash = $act_hash -bor (([BigInteger]$security -band ((1L -shl 53) - 1)) -sh
 $bytes = $act_hash.ToByteArray()
 $KeyData = New-Object 'Byte[]' 13
 [Array]::Copy($bytes, 0, $KeyData, 0, [Math]::Min(13, $bytes.Length))
-$act_data = [Convert]::ToBase64String($KeyData)
 
 Write-Host
-Write-Host "--- Base64 Encoded Result ---" -ForegroundColor Cyan
+Write-Host "--- Base64 Encoded Result * Manual ---" -ForegroundColor Cyan
 
-$act_data
+[Convert]::ToBase64String($KeyData)
+Write-Host
+
+$piddll = Join-Path $PSScriptRoot "pidgenxIn.dll"
+
+# a1 layout the packer reads: group@0, serial@4, flags@8 (bit0=upgrade), security@0x10
+$InputData = [Byte[]]::new(24)
+[BitConverter]::GetBytes([Int32]$Group   ).CopyTo($InputData, 0)   # +0x00
+[BitConverter]::GetBytes([Int32]$serial  ).CopyTo($InputData, 4)   # +0x04  (full serial)
+[BitConverter]::GetBytes([Int32]$upgrade ).CopyTo($InputData, 8)   # +0x08  <-- was missing
+[BitConverter]::GetBytes([Int64]$security).CopyTo($InputData,16)   # +0x10
+
+$InPtr  = New-IntPtr -Data $InputData
+$OutPtr = New-IntPtr -Size 13
+try {
+    $hr = Invoke-UnmanagedMethod -Dll $piddll -Function "Inner" -Sub 0x180008A58 -Values @($InPtr, $OutPtr)
+    if ($hr -ne 0) { throw "packer returned 0x{0:X}" -f $hr }
+
+    $OutData = [Byte[]]::new(13)
+    [Marshal]::Copy($OutPtr, $OutData, 0, 13)
+}
+finally {
+    Free-IntPtr $InPtr
+    Free-IntPtr $OutPtr
+}
+
+Write-Host "--- Base64 Encoded Result * Internal ---" -ForegroundColor Cyan
+[Convert]::ToBase64String($OutData)
 Write-Host
 
 $InstallationIdList = gcim -Query "SELECT ID, OfflineInstallationId FROM SoftwareLicensingProduct WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL"
@@ -1847,7 +1873,6 @@ if ($StoreObj -and $StoreObj["raw"]) {
 }
 
 $WinrtDll = Join-Path $env:windir "System32\LicensingWinRT.dll"
-
 $sub = 0
 
 # using PDB Parser
