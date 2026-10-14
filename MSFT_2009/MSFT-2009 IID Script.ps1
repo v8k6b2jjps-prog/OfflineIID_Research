@@ -10,10 +10,60 @@ using namespace System.Runtime.InteropServices
 
 Clear-Host
 
-# SecurityID cannot be fully recovered (Lossy / Truncated).
-# Parts are checked as boolean flags (e.g., BYTE11 checks if != 0), 
-# and the rest is bit-masked and chopped down into a smaller internal 32-bit field.
-# BYTE11(v53) = (*(_DWORD *)(a1 + 28) != 0 ? 8 : 0) | ...
+<#
+
+-- IID 2009 Case --
+
+SecurityID cannot be fully recovered (Lossy / Truncated).
+Parts are checked as boolean flags (e.g., BYTE11 checks if != 0), 
+and the rest is bit-masked and chopped down into a smaller internal 32-bit field.
+BYTE11(v53) = (*(_DWORD *)(a1 + 28) != 0 ? 8 : 0) | ...
+
+-- Activation Data --
+
+sub_1800090B0 (Base Math Parser / decoder)   -- the real driver in the act path
+└─ sub_180008A58  (THE BIT PACKER)
+	upgrade(bit0) | serial<<1 (30b) | group<<31 (20b) | security<<51 (53b)
+	-> writes the 13 act bytes at buffer +0x48  (= your BigInteger formula, exactly)
+
+sub_18008DE60 (vtable slot 4) is the OTHER caller of the same packer
+(re-encode/compare path), not the one that fills +0x68.
+
+-- Most Updated Struct Info --
+
+// Size: 0x58 (88 bytes) // v12
+typedef struct _MSFT_PKEY_DATA {  // 0x58
+    uint64_t Reserved;            // 0x00
+    uint8_t  Signature[16];       // 0x08
+    uint32_t GroupID;             // 0x18
+    uint32_t ChannelID;           // 0x1C
+    uint32_t Serial;              // 0x20
+    uint32_t Sequence;            // 0x24
+    uint64_t SecurityID;          // 0x28
+    uint32_t HaveRawKey;          // 0x30   (=1)   [was LicenseAttributes]
+    uint32_t Solved;              // 0x34   (=1)   [was KeyType]
+    uint8_t  RawKeyMaterial[16];  // 0x38          [was IssuanceTimestamp/ActivationFlags]
+    uint8_t  ActData[13];         // 0x48   packed upgrade|serial<<1|group<<31|security<<51
+    uint8_t  _pad[3];             // 0x55
+} MSFT_PKEY_DATA;                 // ends 0x58
+
+// Size: 0x98 (152 bytes) // lpMem
+typedef struct _PID_OBJ {
+    uint64_t       RefCount;          // 0x00
+    wchar_t*       ProductIdStr;      // 0x08
+    FILETIME       ValidationTime;    // 0x10
+    uint32_t       DataIdSequence;    // 0x18
+    uint32_t       AlignmentPadding;  // 0x1C
+
+    // v12, Function Take V12+8
+    MSFT_PKEY_DATA Data;              // 0x20 - 0x78
+
+    void*          pPKeyConfig;       // 0x78
+    void*          pKeyBits;          // 0x80
+    void*          pMetadata;         // 0x88
+    uint8_t        RandomSeed[8];     // 0x90
+} PID_OBJ;
+#>
 
 #region Misc
 Function Install-NativeModule {
@@ -1547,7 +1597,235 @@ if (!([PSTypeName]'MSFT').Type) {
   }
 }
 
+#region NativeInterop
+if (!([PSTypeName]'NativeInterop').Type) {
+  Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public class NativeInterop {
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    public delegate int Delegate4Args(long p1, IntPtr p2, long p3, long p4);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    public delegate int Delegate8Args(long p1, long p2, IntPtr p3, long p4, long p5, long p6, long p7, IntPtr p8);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    public delegate int Delegate2PtrArgs(IntPtr p1, IntPtr p2);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    public delegate int DelegateGenArgs(IntPtr p1, long p2, long p3, out IntPtr p4);
+
+    public static IntPtr GetTargetAddress(IntPtr hModule, long rva) {
+        long offset = rva >= 0x180000000 ? rva - 0x180000000 : rva;
+        return new IntPtr(hModule.ToInt64() + offset);
+    }
+
+    public static int Call(IntPtr funcAddress, long p1, IntPtr p2, long p3, long p4) {
+        return Marshal.GetDelegateForFunctionPointer<Delegate4Args>(funcAddress)(p1, p2, p3, p4);
+    }
+
+    public static int Call(IntPtr funcAddress, long p1, long p2, IntPtr p3, long p4, long p5, long p6, long p7, IntPtr p8) {
+        return Marshal.GetDelegateForFunctionPointer<Delegate8Args>(funcAddress)(p1, p2, p3, p4, p5, p6, p7, p8);
+    }
+
+    public static int Call(IntPtr funcAddress, IntPtr p1, IntPtr p2) {
+        return Marshal.GetDelegateForFunctionPointer<Delegate2PtrArgs>(funcAddress)(p1, p2);
+    }
+
+    public static int Call(IntPtr funcAddress, IntPtr p1, long p2, long p3, out IntPtr p4) {
+        return Marshal.GetDelegateForFunctionPointer<DelegateGenArgs>(funcAddress)(p1, p2, p3, out p4);
+    }
+}
+"@
+}
+function Format-HexView {
+    [CmdletBinding(DefaultParameterSetName = "ByteArray")]
+    param (
+        # Parameter Set 1: Standard Byte Array Input
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true, ParameterSetName = "ByteArray")]
+        [byte[]]$Data,
+
+        # Parameter Set 2: Direct Unmanaged Pointer Input
+        [Parameter(Mandatory = $true, Position = 0, ParameterSetName = "Pointer")]
+        [IntPtr]$Address,
+
+        [Parameter(Mandatory = $true, Position = 1, ParameterSetName = "Pointer")]
+        [int]$Size,
+
+        [ValidateSet("4x", "8x", "16x")]
+        [string]$Mode = "8x"
+    )
+
+    begin {
+        $fullBuffer = [System.Collections.Generic.List[byte]]::new()
+        $Count = [int]($Mode.Replace("x", ""))
+        
+        if ($PsCmdlet.ParameterSetName -eq "Pointer") {
+            if ($Address -eq [IntPtr]::Zero -or $Size -le 0) {
+                Write-Error "Invalid memory pointer address or size requested."
+                return
+            }
+            $tempArray = [byte[]]::new($Size)
+            [System.Runtime.InteropServices.Marshal]::Copy($Address, $tempArray, 0, $Size)
+            $fullBuffer.AddRange($tempArray)
+        }
+    }
+    process {
+        # Validated: Null check keeps 0x00 bytes intact through pipeline unrolling
+        if ($PsCmdlet.ParameterSetName -eq "ByteArray" -and $null -ne $Data) {
+            $fullBuffer.AddRange($Data)
+        }
+    }
+    end {
+        if ($fullBuffer.Count -eq 0) {
+            Write-Warning "Hex view buffer is empty."
+            return
+        }
+
+        Write-Host "--- Total: $($fullBuffer.Count) bytes | Alignment: $Mode ---" -ForegroundColor Cyan
+        
+        for ($i = 0; $i -lt $fullBuffer.Count; $i += $Count) {
+            $remaining = [Math]::Min($Count, $fullBuffer.Count - $i)
+            
+            $hexElements = [string[]]::new($remaining)
+            for ($j = 0; $j -lt $remaining; $j++) {
+                $hexElements[$j] = "{0:X2}" -f $fullBuffer[$i + $j]
+            }
+            
+            $hexPart = $hexElements -join " "
+            "{0:X4} : {1}" -f $i, $hexPart
+        }
+    }
+}
+#endregion
+
 Clear-Host
+Write-Host
+
+Set-Location $PSScriptRoot
+
+$CdKey   = 'NW6C2-QMPVW-D7KKK-3GKT6-VCFB2'
+$DllPath = Join-Path $PSScriptRoot "pidgenxIn.dll"
+$CfgPath = 'C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms'
+$hModule = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $DllPath
+
+$tmpPtr  = New-IntPtr -Size 8
+$func1 = [NativeInterop]::GetTargetAddress($hModule, 0x180015270)
+[NativeInterop]::Call($func1, $tmpPtr, [IntPtr]::Zero) | Out-Null
+$Address = [Marshal]::ReadIntPtr($tmpPtr)
+[Marshal]::FreeHGlobal($tmpPtr)
+
+$CfgPtr = [Marshal]::StringToHGlobalUni($CfgPath)
+$func2  = [NativeInterop]::GetTargetAddress($hModule, 0x18000C970)
+
+Write-Host "Loading 7601 Configuration Rules..." -ForegroundColor Cyan
+$hr = [NativeInterop]::Call($func2, $Address.ToInt64(), $CfgPtr, 0L, 0L)
+[Marshal]::FreeHGlobal($CfgPtr)
+Write-Host "Loader Return HRESULT: 0x$($hr.ToString('X'))`n"
+
+# ==========================================
+# STEP 2 & 3: ALLOCATE INPUT & EXECUTE DISPATCHER
+# ==========================================
+$KeyPtr    = [Marshal]::StringToHGlobalUni($CdKey)
+$OutObjPtr = [Marshal]::AllocHGlobal(8)
+[Marshal]::WriteInt64($OutObjPtr, 0)
+
+$func3 = [NativeInterop]::GetTargetAddress($hModule, 0x180009338)
+
+Write-Host "Invoking sub_180009338 Directly..." -ForegroundColor Cyan
+$hr = [NativeInterop]::Call($func3, ([Int64]$Address + 0x10), 0L, $KeyPtr, 0L, 0L, 0L, 0L, $OutObjPtr)
+Write-Host "Direct Subroutine HRESULT: 0x$($hr.ToString('X'))"
+
+$HeapPtr = [Marshal]::ReadIntPtr($OutObjPtr)
+[Marshal]::FreeHGlobal($OutObjPtr)
+if ([long]$HeapPtr -le 0) { return }
+
+# Parse and Extract Struct Metadata Fields
+$KeyIDValue    = [Marshal]::ReadInt32($HeapPtr, 0x18) # Serial
+$GroupIDValue  = [Marshal]::ReadInt32($HeapPtr, 0x38) # Group
+$SecurityValue = [Marshal]::ReadInt64($HeapPtr, 0x48) # Security
+$LicenseFlags  = [Marshal]::ReadInt32($HeapPtr, 0x44) # Flags
+$UpgradeText   = if (($LicenseFlags -band 0x1) -eq 1) { "Yes" } else { "No" }
+
+# NEW: Read the nested pointer at offset +8, then decode the Wide String
+$StringPtr        = [Marshal]::ReadIntPtr($HeapPtr, 8)
+$FinalString      = "NULL"
+if ($StringPtr -ne [IntPtr]::Zero) {
+    $FinalString = [Marshal]::PtrToStringUni($StringPtr)
+}
+
+Write-Host "`n--- Decoded Fields ---" -ForegroundColor Green
+Write-Host "IsUpgrade    : $UpgradeText"
+Write-Host "Group ID     : $GroupIDValue (0x$($GroupIDValue.ToString('X')))"
+Write-Host "Serial       : $KeyIDValue (0x$($KeyIDValue.ToString('X')))"
+Write-Host "Security     : $SecurityValue (0x$($SecurityValue.ToString('X')))" -ForegroundColor Cyan
+Write-Host "Final String : $FinalString" -ForegroundColor Yellow
+Write-Host
+
+$SerialA = [Marshal]::ReadInt32($HeapPtr, 0x3C)
+$SerialB = [Marshal]::ReadInt32($HeapPtr, 0x40)
+Write-Host "Serial A (0x3C)  : $SerialA (0x$($SerialA.ToString('X')))"
+Write-Host "Serial B (0x40)  : $SerialB (0x$($SerialB.ToString('X')))"
+Write-Host ("Serial Full      : {0}" -f ($SerialA.ToString() + $SerialB.ToString()))
+Write-Host
+
+Format-HexView -Address $HeapPtr -Size 128 -Mode 16x
+
+# STEP 4: EXECUTE BASE MATH LAYER PARSER BLOCK (sub_1800090B0)
+$v75Buffer  = New-IntPtr -Size 96
+$func4     = [NativeInterop]::GetTargetAddress($hModule, 0x1800090B0)
+
+Write-Host "`nInvoking Base Math Parser (sub_1800090B0)..." -ForegroundColor Cyan
+$hr = [NativeInterop]::Call($func4, $KeyPtr, $v75Buffer)
+Write-Host "Math Layer HRESULT: 0x$($hr.ToString('X'))"
+
+if ($hr -eq 0) {
+    Write-Host "`n--- Raw v75 Buffer Extraction Results ---" -ForegroundColor Green
+    Format-HexView -Address $v75Buffer -Size 96 -Mode 16x
+}
+Free-IntPtr $v75Buffer -Method Auto
+
+# =====================================================================
+# NEW STEP: MANUALLY MANUFACTURE AND BASE64 ENCODE THE MATERIAL 
+# =====================================================================
+Write-Host
+Write-Host "Re-manufacturing the 13-Byte Material Block..." -ForegroundColor Cyan
+
+# +0x68 is the inline 13-byte act blob (NOT a pointer)
+$ActPtr = [IntPtr]::Add($HeapPtr, 0x68)
+
+$managedBytes = New-Object Byte[] 13
+[Marshal]::Copy($ActPtr, $managedBytes, 0, 13)
+
+Write-Host "`n--- Raw Material Structure (Before Base64) ---" -ForegroundColor Green
+Format-HexView -Data $managedBytes -Mode 4x
+
+$base64String = [Convert]::ToBase64String($managedBytes)
+Write-Host
+Write-Host "--- Base64 Encoded Result ---" -ForegroundColor Cyan
+Write-Host $base64String
+# -> AAAAgF4GeGd7i+f+Ew==
+
+[long]$serial   = $KeyIDValue
+[long]$security = $SecurityValue
+[int32]$upgrade = [Int](($LicenseFlags -band 0x1) -eq 1)
+[Int32]$Group   = $groupIDValue
+
+[System.Numerics.BigInteger]$act_hash = [BigInteger]$upgrade -band 1
+$act_hash = $act_hash -bor (([BigInteger]$serial -band ((1L -shl 30) - 1)) -shl 1)
+$act_hash = $act_hash -bor (([BigInteger]$Group -band ((1L -shl 20) - 1)) -shl 31)
+$act_hash = $act_hash -bor (([BigInteger]$security -band ((1L -shl 53) - 1)) -shl 51)
+$bytes = $act_hash.ToByteArray()
+$KeyData = New-Object 'Byte[]' 13
+[Array]::Copy($bytes, 0, $KeyData, 0, [Math]::Min(13, $bytes.Length))
+$act_data = [Convert]::ToBase64String($KeyData)
+
+Write-Host
+Write-Host "--- Base64 Encoded Result ---" -ForegroundColor Cyan
+
+$act_data
 Write-Host
 
 $InstallationIdList = gcim -Query "SELECT ID, OfflineInstallationId FROM SoftwareLicensingProduct WHERE PartialProductKey IS NOT NULL AND OfflineInstallationId IS NOT NULL"
@@ -1608,7 +1886,43 @@ if ($hr -ge 0 -and $params[2].Value -ne 0L) {
 
 # Windows 10-11 Education Key
 # NW6C2-QMPVW-D7KKK-3GKT6-VCFB2
-$BinKey = [BinaryKey]::new('NW6C2-QMPVW-D7KKK-3GKT6-VCFB2')
+$BinKey = [BinaryKey]::new($CdKey)
+
+# ==========================================
+# RE-ENCODE / GENERATE IID (sub_1800065DC)
+# ==========================================
+
+Write-Host "`n--- Re-Encoding Fields into IID String ---" -ForegroundColor Cyan
+
+$bufSizeGen = 0x58
+$bufferGen  = [byte[]]::new($bufSizeGen)
+[Array]::Clear($bufferGen, 0,$bufferGen.Length)
+
+#$SerialA = [Math]::Floor($Serial / 1000000)
+#$SerialB = $Serial % 1000000
+
+# Populate structure fields for generation
+[BitConverter]::GetBytes([Int32]$GroupIDValue).CopyTo($bufferGen, 0x18) 
+[BitConverter]::GetBytes([Int32]$SerialA).CopyTo($bufferGen, 0x1C) 
+[BitConverter]::GetBytes([Int32]$SerialB).CopyTo($bufferGen, 0x20) 
+[BitConverter]::GetBytes([Int32]0).CopyTo($bufferGen, 0x24)
+[BitConverter]::GetBytes([Int64]$SecurityValue).CopyTo($bufferGen, 0x28)
+
+$hBufferGen = New-IntPtr -Size $bufSizeGen
+[Marshal]::Copy($bufferGen, 0, $hBufferGen,$bufSizeGen)
+
+$hwidVal       = $ShortHWID
+$pOutString    = ''
+$outStrPtr     = [IntPtr]::Zero
+$signatureBase = [IntPtr]::Add($hBufferGen, 0x8)
+
+$funcGen = [NativeInterop]::GetTargetAddress($hModule, 0x180006738)
+$hrGen = [NativeInterop]::Call($funcGen, $signatureBase, $hwidVal, 0L, [ref]$outStrPtr)
+$pOutString = if ($outStrPtr -ne [IntPtr]::Zero) {
+  [Marshal]::PtrToStringUni($outStrPtr) 
+}
+Free-IntPtr $hBufferGen -Method Auto
+Write-Host "Generated IID String : $pOutString" -ForegroundColor Green
 
 # Allocate space for 64+ characters (plus null terminator)
 $bufferSize = 128
