@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -368,6 +368,116 @@ namespace PidKeyPlugIn
     }
 
     // -------------------------------------------------------------------------
+    // GF(p) 开平方与曲线提升，全部在 Montgomery 域里做。
+    // 与 Fp.Sqrt / Curve.LiftX 同一算法（Tonelli-Shanks）、同一答案（较小的根），
+    // 但每次模乘是两次定长 Fpm.Mul 而不是 BigInteger 乘 + 除，且 q、(q+1)/2、z^q
+    // 只跟 p 有关，只算一次。原来的 BigInteger 版保留作参考实现。
+    // 去掉了 Euler 判别式的预检：非二次剩余时 t = a^q 的阶恰为 2^s，
+    // 循环必然走到 i >= m 返回「无根」—— 答案相同，少一次完整幂。
+    // -------------------------------------------------------------------------
+    public static class FpmSqrt
+    {
+        static int _s;
+        static byte[] _qBits, _q1Bits;
+        static Fpx _c;
+        static volatile bool _ready;
+        static readonly object _gate = new object();
+
+        static Fpx Pow(Fpx a, byte[] bits)
+        {
+            Fpx r = Fpm.One, b = a;
+            for (int i = 0; i < bits.Length; i++)
+            {
+                if (bits[i] != 0) r = Fpm.Mul(r, b);
+                b = Fpm.Mul(b, b);
+            }
+            return r;
+        }
+
+        static void Init()
+        {
+            if (_ready) return;
+            lock (_gate)
+            {
+                if (_ready) return;
+                Fpm.Init();
+                BigInteger p = Gf.P;
+                BigInteger pm1 = p - 1;
+                BigInteger q = pm1;
+                int s = 0;
+                while (q.IsEven) { q >>= 1; s++; }
+                _s = s;
+                _qBits = ExpBits.Expand(q);
+                _q1Bits = ExpBits.Expand((q + 1) >> 1);
+                // 最小的非二次剩余 z >= 2（与 Fp.NonResidue 同一搜索顺序 ⇒ 同一个 c）
+                BigInteger half = pm1 >> 1;
+                BigInteger z = 2;
+                while (BigInteger.ModPow(z, half, p).IsOne) z += 1;
+                _c = Pow(Fpm.FromBig(z), _qBits);
+                _ready = true;                      // ★ 最后才发布
+            }
+        }
+
+        /// <summary>Montgomery 形式元素的平方根；非二次剩余返回 false。输出较小的根。</summary>
+        public static bool SqrtM(Fpx am, out BigInteger root)
+        {
+            Init();
+            root = BigInteger.Zero;
+            if (am.A0 == 0 && am.A1 == 0 && am.A2 == 0 && am.A3 == 0) return true;
+
+            Fpx x = Pow(am, _q1Bits);
+            Fpx t = Pow(am, _qBits);
+            Fpx c = _c;
+            int m = _s;
+            Fpx one = Fpm.One;
+
+            while (!t.Eq(one))
+            {
+                int i = 0;
+                Fpx tt = t;
+                while (!tt.Eq(one))
+                {
+                    tt = Fpm.Mul(tt, tt);
+                    i++;
+                    if (i >= m) return false;
+                }
+                Fpx b = c;
+                for (int k = 0; k < m - i - 1; k++) b = Fpm.Mul(b, b);
+                x = Fpm.Mul(x, b);
+                Fpx b2 = Fpm.Mul(b, b);
+                t = Fpm.Mul(t, b2);
+                c = b2;
+                m = i;
+            }
+
+            BigInteger xv = Fpm.ToBig(x);
+            BigInteger hi = Gf.P - xv;
+            root = xv <= hi ? xv : hi;
+            return true;
+        }
+
+        public static BigInteger? Sqrt(BigInteger a)
+        {
+            Init();
+            BigInteger r;
+            if (!SqrtM(Fpm.FromBig(a), out r)) return null;
+            return r;
+        }
+
+        /// <summary>等价于 Curve.LiftX：返回 {y, -y}，y 取 x³+ax+b 较小的根；无解返回 null。</summary>
+        public static BigInteger[] LiftX(BigInteger x, BigInteger a, BigInteger b)
+        {
+            Init();
+            Fpx xm = Fpm.FromBig(x), am = Fpm.FromBig(a), bm = Fpm.FromBig(b);
+            // x·(x·x + a) + b == x³ + a·x + b
+            Fpx rhs = Fp6mOp.AddX(Fpm.Mul(xm, Fp6mOp.AddX(Fpm.Mul(xm, xm), am)), bm);
+            BigInteger yv;
+            if (!SqrtM(rhs, out yv)) return null;
+            return new BigInteger[] { yv, Gf.Mod(-yv) };
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // E6 上的点（坐标在 K6 里）
     // -------------------------------------------------------------------------
     public struct Pt6
@@ -442,9 +552,7 @@ namespace PidKeyPlugIn
     {
         public static int BitLength(BigInteger v)
         {
-            int n = 0;
-            while (v > 0) { v >>= 1; n++; }
-            return n;
+            return ExpBits.Expand(v).Length;
         }
 
         static Fp6 Emb(BigInteger v) { return Fp6.FromFp3(new Fp3(v, 0, 0)); }
@@ -456,74 +564,178 @@ namespace PidKeyPlugIn
             return (Q.Y - Emb(y1)) - lam * (Q.X - Emb(x1));
         }
 
+        /// <summary>单点配对 = 只含一个 Q 的 MultiPair，结果与旧的逐点实现逐位相同。</summary>
         public static Fp6 Pair(BigInteger n, BigInteger Tx, BigInteger Ty, Pt6 Q, BigInteger a)
         {
-            Fp6 f = Fp6.One;
-            BigInteger vx = Tx, vy = Ty;
+            return MultiPair(n, Tx, Ty, new Pt6[] { Q }, a)[0];
+        }
+
+        /// <summary>
+        /// 共享阶梯的多点配对。T 侧的倍点/加点阶梯与 Q 无关，只跑一次；
+        /// 每一步只对每个 Q_i 求直线值。原来每个 Q 各跑一遍完整阶梯，
+        /// 每一步还要付一次 BigInteger 版的求逆（Fermat，~165 次模乘），14 个点 × ~220 步。
+        /// 这里阶梯整体在 Montgomery 域（定长 limb，零堆分配），
+        /// 每步只做一次求逆，对所有 Q 共用。
+        /// </summary>
+        public static Fp6[] MultiPair(BigInteger n, BigInteger Tx, BigInteger Ty, Pt6[] Qs, BigInteger a)
+        {
+            Fpm.Init();
+            int m = Qs.Length;
+            Fp6m[] f = new Fp6m[m];
+            Fp6m[] Qx = new Fp6m[m], Qy = new Fp6m[m];
+            Fp6m one = Fp6mOp.One();
+            for (int j = 0; j < m; j++)
+            {
+                f[j] = one;
+                Qx[j] = Fp6m.FromFp6(Qs[j].X);
+                Qy[j] = Fp6m.FromFp6(Qs[j].Y);
+            }
+
+            Fpx vxm = Fpm.FromBig(Tx), vym = Fpm.FromBig(Ty);
+            Fpx txm = vxm, tym = vym;
+            Fpx am = Fpm.FromBig(a);
+            Fpx zeroM = Fpx.Make(0, 0, 0, 0);
+            Fpx threeM = Fpm.FromBig(3);
             bool vInf = false;
-            int L = BitLength(n);
+            byte[] nbits = ExpBits.Expand(n);
+            int L = nbits.Length;
 
             for (int i = L - 2; i >= 0; i--)
             {
-                // ---- 倍点 V -> 2V ----
-                if (!vInf)
-                {
-                    if (vy == 0) { vInf = true; }                       // 2-挠点
-                    else
-                    {
-                        BigInteger lam = Gf.Mod(Gf.Mod(3 * vx * vx + a) * Fpm.InvBig(Gf.Mod(2 * vy)));
-                        Fp6 l = (Q.Y - Emb(vy)) - Emb(lam) * (Q.X - Emb(vx));
-                        BigInteger x2 = Gf.Mod(lam * lam - 2 * vx);
-                        BigInteger y2 = Gf.Mod(lam * (vx - x2) - vy);
-                        f = (f * f) * l;              // 分母消除，见上
-                        vx = x2; vy = y2;
-                    }
-                }
-                else f = f * f;                                         // V = ∞：直线平凡
+                if ((i & 3) == 0 && CancelFlag.IsSet()) return null;      // TryBinks: another group already matched
+                // ---- 倍点：与 m 无关，只算一次 ----
+                // 三种情形：已是无穷远 / 刚变成无穷远（y==0，f 不动）/ 正常
+                const int WAS_INF = 0, BECAME_INF = 1, NORMAL = 2;
+                int dcase;
+                Fpx vxOld = vxm, vyOld = vym, lam = zeroM;
 
-                // ---- 按 n 的当前位决定是否加 T ----
-                if (!((n >> i) & BigInteger.One).IsZero)
+                if (vInf) dcase = WAS_INF;
+                else if (vym.Eq(zeroM)) { vInf = true; dcase = BECAME_INF; }
+                else
                 {
+                    dcase = NORMAL;
+                    Fpx invTwoVy = Fpm.Inv(Fp6mOp.AddX(vym, vym));
+                    Fpx vxSq = Fpm.Mul(vxm, vxm);
+                    Fpx numPart = Fp6mOp.AddX(Fpm.Mul(threeM, vxSq), am);
+                    lam = Fpm.Mul(numPart, invTwoVy);
+
+                    Fpx lamSq = Fpm.Mul(lam, lam);
+                    Fpx x2 = Fp6mOp.SubX(lamSq, Fp6mOp.AddX(vxm, vxm));
+                    Fpx y2 = Fp6mOp.SubX(Fpm.Mul(lam, Fp6mOp.SubX(vxm, x2)), vym);
+                    vxm = x2; vym = y2;
+                }
+                Fp6m embVy = one, embVx = one;
+                if (dcase == NORMAL)
+                {
+                    embVy = Fp6mOp.FromFpxEmbedding(vyOld);
+                    embVx = Fp6mOp.FromFpxEmbedding(vxOld);
+                }
+                for (int j = 0; j < m; j++)
+                {
+                    if (dcase == NORMAL)
+                    {
+                        Fp6m term1 = Fp6mOp.Sub6(Qy[j], embVy);
+                        Fp6m term2 = Fp6mOp.ScaleFp(lam, Fp6mOp.Sub6(Qx[j], embVx));
+                        Fp6m l = Fp6mOp.Sub6(term1, term2);
+                        f[j] = Fp6mOp.Mul6(Fp6mOp.Sqr6(f[j]), l);        // 分母消除，见上
+                    }
+                    else if (dcase == WAS_INF)
+                    {
+                        f[j] = Fp6mOp.Sqr6(f[j]);
+                    }
+                    // BECAME_INF：f 不动
+                }
+
+                // ---- 按 n 的当前位决定是否加 T：同样共享 ----
+                if (nbits[i] != 0)
+                {
+                    Fpx addVxOld = zeroM, addVyOld = zeroM, addLam = zeroM;
+                    bool haveAddLine = false, becameInf = false, tookT = false;
+
                     if (vInf)
                     {
-                        // ∞ + T = T，直线平凡
-                        vx = Tx; vy = Ty; vInf = false;
+                        vxm = txm; vym = tym; vInf = false; tookT = true;     // ∞ + T = T
                     }
-                    else if (vx == Tx && vy == Ty)
+                    else if (vxm.Eq(txm) && vym.Eq(tym))
                     {
-                        // V == T：退化为倍点
-                        BigInteger lam = Gf.Mod(Gf.Mod(3 * vx * vx + a) * Fpm.InvBig(Gf.Mod(2 * vy)));
-                        Fp6 l = (Q.Y - Emb(vy)) - Emb(lam) * (Q.X - Emb(vx));
-                        BigInteger x2 = Gf.Mod(lam * lam - 2 * vx);
-                        BigInteger y2 = Gf.Mod(lam * (vx - x2) - vy);
-                        f = f * l;                    // 分母消除
-                        vx = x2; vy = y2;
+                        addVxOld = vxm; addVyOld = vym;                       // V == T：退化为倍点
+                        Fpx invTwoVy = Fpm.Inv(Fp6mOp.AddX(vym, vym));
+                        Fpx vxSq = Fpm.Mul(vxm, vxm);
+                        Fpx numPart = Fp6mOp.AddX(Fpm.Mul(threeM, vxSq), am);
+                        addLam = Fpm.Mul(numPart, invTwoVy);
+                        haveAddLine = true;
+
+                        Fpx lamSq = Fpm.Mul(addLam, addLam);
+                        Fpx x2 = Fp6mOp.SubX(lamSq, Fp6mOp.AddX(vxm, vxm));
+                        Fpx y2 = Fp6mOp.SubX(Fpm.Mul(addLam, Fp6mOp.SubX(vxm, x2)), vym);
+                        vxm = x2; vym = y2;
                     }
-                    else if (vx == Tx)
+                    else if (vxm.Eq(txm))
                     {
-                        // V == -T：直线是垂直线，V + T = ∞，除数取 1
-                        // （这是**正常**情形 —— 循环最后一轮必然出现：
-                        //   V = [(n-1)/2]T 倍点后 = [(n-1)]T = -T）
-                        f = f * (Q.X - Emb(vx));
+                        addVxOld = vxm;                                       // V == -T：垂直线
+                        becameInf = true;
                         vInf = true;
                     }
                     else
                     {
-                        BigInteger lam = Gf.Mod(Gf.Mod(vy - Ty) * Fpm.InvBig(Gf.Mod(vx - Tx)));
-                        Fp6 l = (Q.Y - Emb(vy)) - Emb(lam) * (Q.X - Emb(vx));
-                        BigInteger x3 = Gf.Mod(lam * lam - vx - Tx);
-                        BigInteger y3 = Gf.Mod(lam * (vx - x3) - vy);
-                        f = f * l;                    // 分母消除
-                        vx = x3; vy = y3;
+                        addVxOld = vxm; addVyOld = vym;
+                        Fpx invDiff = Fpm.Inv(Fp6mOp.SubX(vxm, txm));
+                        Fpx numDiff = Fp6mOp.SubX(vym, tym);
+                        addLam = Fpm.Mul(numDiff, invDiff);
+                        haveAddLine = true;
+
+                        Fpx lamSq = Fpm.Mul(addLam, addLam);
+                        Fpx x3 = Fp6mOp.SubX(Fp6mOp.SubX(lamSq, vxm), txm);
+                        Fpx y3 = Fp6mOp.SubX(Fpm.Mul(addLam, Fp6mOp.SubX(vxm, x3)), vym);
+                        vxm = x3; vym = y3;
+                    }
+
+                    Fp6m embAddVy = one, embAddVx = one;
+                    if (!tookT && (becameInf || haveAddLine))
+                    {
+                        embAddVx = Fp6mOp.FromFpxEmbedding(addVxOld);
+                        if (haveAddLine) embAddVy = Fp6mOp.FromFpxEmbedding(addVyOld);
+                    }
+                    for (int j = 0; j < m; j++)
+                    {
+                        if (tookT) continue;                                  // 纯重置，没有直线因子
+                        if (becameInf)
+                        {
+                            f[j] = Fp6mOp.Mul6(f[j], Fp6mOp.Sub6(Qx[j], embAddVx));
+                        }
+                        else if (haveAddLine)
+                        {
+                            Fp6m term1 = Fp6mOp.Sub6(Qy[j], embAddVy);
+                            Fp6m term2 = Fp6mOp.ScaleFp(addLam, Fp6mOp.Sub6(Qx[j], embAddVx));
+                            Fp6m l = Fp6mOp.Sub6(term1, term2);
+                            f[j] = Fp6mOp.Mul6(f[j], l);
+                        }
                     }
                 }
             }
 
-            // ---- 最终幂 ----
-            BigInteger e = (BigInteger.Pow(Gf.P, 6) - 1) / n;
-            // 最终幂占了单次配对约 3/4 的时间，而这里还在用 BigInteger 版 Fp6。
-            // 接到 Montgomery 层后 14 次配对从 ~0.50s 降到 ~0.1s。
-            return Fp6mOp.PowBigM(f, e);
+            // ---- 最终幂 f^((p^6-1)/n) ----
+            // (p^6-1)/n = (p^3-1)·((p^3+1)/n)。f^(p^3-1) 只要一次共轭 + 一次 Fp3 求逆，
+            // 剩下的幂不到原来的一半长。仅当 n | p^3+1 时成立（2005 年的曲线都满足），
+            // 否则退回完整幂。
+            BigInteger p = Gf.P;
+            BigInteger p3 = p * p * p;
+            Fp6[] res = new Fp6[m];
+            if (((p3 + 1) % n).IsZero)
+            {
+                // (p^3+1)/n 随曲线阶 n 变（同一基域下不同 bink 的 n 可以不同），不能跨调用缓存；
+                // 本次调用内 m 个点共用同一个展开。
+                byte[] hardBits = ExpBits.Expand((p3 + 1) / n);
+                for (int j = 0; j < m; j++)
+                    res[j] = Fp6mOp.ToFp6(Fp6mOp.FinalExpBits(f[j], hardBits));
+            }
+            else
+            {
+                BigInteger e = (p3 * p3 - 1) / n;
+                for (int j = 0; j < m; j++)
+                    res[j] = Fp6mOp.PowBigM(Fp6mOp.ToFp6(f[j]), e);
+            }
+            return res;
         }
 
         public static BigInteger Order;   // 由调用方设置
@@ -636,6 +848,15 @@ namespace PidKeyPlugIn
     //  为什么是 H1Bases[1+k]：dataOff 指向公钥里那个被跳过的字节（偏移 59），
     //  所以 dataOff+2 = 偏移 61 = H1Bases[1]。这一条已用三组黄金 M 验证。
     // =========================================================================
+    /// <summary>Per-thread "somebody else already found the answer" flag used by PKeyCalc.TryBinks.
+    /// Box is null outside TryBinks, so single calls (TryPubKey, Pair, Solve) are unaffected.</summary>
+    internal static class CancelFlag
+    {
+        [ThreadStatic] public static int[] Box;
+        public static bool IsSet() { return IsSet(Box); }
+        public static bool IsSet(int[] box) { return box != null && System.Threading.Volatile.Read(ref box[0]) != 0; }
+    }
+
     public static class PKeyCalc
     {
         /// <summary>
@@ -691,6 +912,58 @@ namespace PidKeyPlugIn
             return true;
         }
 
+        /// <summary>
+        /// false (default): the first group that matches stops all workers at once (fastest; a key normally
+        /// belongs to exactly one group). true: lower-index groups still finish, so the LOWEST group id wins,
+        /// exactly like a sequential scan.
+        /// </summary>
+        public static bool DeterministicBinks = false;
+
+        /// <summary>
+        /// Batch version of TryPubKey: tests ONE key against MANY public keys in parallel
+        /// (Parallel.For over the groups; every call is independent, inner MITM stays single-threaded).
+        /// Fast by default (first match stops everyone); set DeterministicBinks = true for lowest-index-wins.
+        /// Returns 1 = valid, 0 = no group matched, -1 = bad arguments.
+        /// </summary>
+        /// <param name="publicKeys">full public key bytes per group (PublicKeyPart1 + Part2)</param>
+        /// <param name="groupIds">group id per entry (same length as publicKeys)</param>
+        /// <param name="threads">0 = all cores</param>
+        public static int TryBinks(byte[][] publicKeys, int[] groupIds, byte[] bEncryptArray, int threads,
+                                   out int groupId, out byte[] h1Coeffs, out byte[] uid)
+        {
+            groupId = 0; h1Coeffs = null; uid = null;
+            if (publicKeys == null || groupIds == null || publicKeys.Length != groupIds.Length) return -1;
+            if (bEncryptArray == null || bEncryptArray.Length != 16) return -1;
+
+            int n = publicKeys.Length;
+            int best = int.MaxValue;
+            int[] cancelBox = new int[1];
+            byte[] bestH = null, bestU = null;
+            object gate = new object();
+            var opt = new System.Threading.Tasks.ParallelOptions();
+            opt.MaxDegreeOfParallelism = threads > 0 ? threads : Environment.ProcessorCount;
+
+            System.Threading.Tasks.Parallel.For(0, n, opt, delegate (int i, System.Threading.Tasks.ParallelLoopState st)
+            {
+                if (st.IsStopped || System.Threading.Volatile.Read(ref cancelBox[0]) != 0) return;                                   // somebody already matched (fast mode)
+                if (st.LowestBreakIteration.HasValue && st.LowestBreakIteration.Value < i) return;
+                int seq; string cfg; byte[] h, u;
+                bool ok;
+                CancelFlag.Box = DeterministicBinks ? null : cancelBox;      // fast mode: running groups see the match and bail out
+                try { ok = TryPubKey(publicKeys[i], bEncryptArray, out seq, out cfg, out h, out u); }
+                catch { return; }                       // a bad / foreign-field entry only skips itself
+                finally { CancelFlag.Box = null; }
+                if (!ok) return;
+                lock (gate) { if (i < best) { best = i; bestH = h; bestU = u; } }
+                if (DeterministicBinks) st.Break();
+                else { System.Threading.Volatile.Write(ref cancelBox[0], 1); st.Stop(); }
+            });
+
+            if (best == int.MaxValue) return 0;
+            groupId = groupIds[best]; h1Coeffs = bestH; uid = bestU;
+            return 1;
+        }
+
         // ---- 分段计时（单线程测量用；并发调用时互相覆盖，只在 bench 里读）----
         public static double TLastPairMs, TLastMitmMs;
 
@@ -706,8 +979,10 @@ namespace PidKeyPlugIn
             BigInteger xT = Gf.Mod(B);                     // 余数 = x(T)
             int keyByte = (int)((B / Gf.P) & 0xFF);        // 商 = h1Coeffs[0]
 
-            BigInteger[] T = Curve.LiftX(xT, k.CurveA, k.CurveB);
+            // lift_x 在 Montgomery 域里做（同一算法、同一个根）
+            BigInteger[] T = FpmSqrt.LiftX(xT, k.CurveA, k.CurveB);
             if (T == null) return false;
+            if (CancelFlag.IsSet()) return false;
 
             // h1Coeffs[0..3]：keyByte、常量 1、keyByte 的两个混合进制位
             h1 = new byte[15];
@@ -717,18 +992,20 @@ namespace PidKeyPlugIn
             h1[2] = (byte)(keyByte % b1);
             h1[3] = (byte)((keyByte / b1) % b2);
 
-            // 14 个配对 g_i = e(T, Q_i)
+            // 14 个配对 g_i = e(T, Q_i)，共享一条 Miller 阶梯
             var swPair = System.Diagnostics.Stopwatch.StartNew();
-            Fp3 inv2 = new Fp3(-2, 0, 0).Inverse();
+            // 1/(-2) 是基域标量，且 p 为奇数 ⇒ -2·(p-1)/2 = -(p-1) ≡ 1，闭式 (p-1)/2，不用求逆。
+            Fp3 inv2 = new Fp3((Gf.P - 1) >> 1, 0, 0);
             Fp3 inv2sq = inv2 * inv2;
             int np = k.Points.Count;
-            Fp6[] g = new Fp6[np];
+            Pt6[] Qs = new Pt6[np];
             for (int i = 0; i < np; i++)
             {
-                Pt6 Qi = Pt6.From(Fp6.FromFp3(k.Points[i][0] * inv2),
-                                  new Fp6(Fp3.Zero, k.Points[i][1] * inv2sq));
-                g[i] = TatePairing.Pair(k.Order, xT, T[0], Qi, k.CurveA);
+                Qs[i] = Pt6.From(Fp6.FromFp3(k.Points[i][0] * inv2),
+                                 new Fp6(Fp3.Zero, k.Points[i][1] * inv2sq));
             }
+            Fp6[] g = TatePairing.MultiPair(k.Order, xT, T[0], Qs, k.CurveA);
+            if (g == null) return false;                   // cancelled
             swPair.Stop();
             TLastPairMs = swPair.Elapsed.TotalMilliseconds;
 
@@ -741,8 +1018,12 @@ namespace PidKeyPlugIn
 
             Fp6 pv = new Fp6(k.PairingVal[0], k.PairingVal[1]);
             string note;
+            // 1/pv：配对值是酉元，逆元就是共轭 (c0, -c1)，一次乘法确认；
+            // 不是酉元则退回真正的求逆。
+            Fp6 target = new Fp6(pv.C0, -pv.C1);
+            if (!(pv * target).Equals(Fp6.One)) target = Fp6.One / pv;
             var swMitm = System.Diagnostics.Stopwatch.StartNew();
-            int[] sol = H1Search.Solve(g, Fp6.One / pv, lo, hi, out note, 1);
+            int[] sol = H1Search.Solve(g, target, lo, hi, out note, 1);
             swMitm.Stop();
             TLastMitmMs = swMitm.Elapsed.TotalMilliseconds;
             if (sol == null) return false;                 // Solve 内部已同时查过 pv 与其逆元
@@ -828,11 +1109,35 @@ namespace PidKeyPlugIn
         { return A0 == o.A0 && A1 == o.A1 && A2 == o.A2 && A3 == o.A3; }
     }
 
+    /// <summary>
+    /// 把非负 BigInteger 一次性展开成「低位在前」的位数组。
+    /// 指数只跟 p / 曲线阶有关，每次幂运算里反复 (e & 1) + (e >>= 1) 会每一位
+    /// 分配两个 BigInteger —— 配对的最终幂和 Fp3 求逆合起来是几千次堆分配。
+    /// 展开一次、反复使用，乘法/平方次数与顺序完全不变，结果逐位相同。
+    /// </summary>
+    public static class ExpBits
+    {
+        public static byte[] Expand(BigInteger e)
+        {
+            if (e.Sign <= 0) return new byte[0];
+            byte[] raw = e.ToByteArray();               // 小端，正数可能多带一个 0x00
+            int top = raw.Length - 1;
+            while (top > 0 && raw[top] == 0) top--;
+            int hiBit = 7;
+            while (hiBit > 0 && ((raw[top] >> hiBit) & 1) == 0) hiBit--;
+            int nbits = top * 8 + hiBit + 1;
+            byte[] bits = new byte[nbits];
+            for (int i = 0; i < nbits; i++) bits[i] = (byte)((raw[i >> 3] >> (i & 7)) & 1);
+            return bits;
+        }
+    }
+
     public static class Fpm
     {
         const ulong M = 0xFFFFFFFFUL;
         public static ulong PB0_, PB1_, PB2_, PB3_;
-        static ulong N0INV;
+        internal static ulong N0INV;
+        static byte[] _pm2Bits;                 // p-2，低位在前；Init() 里算好
         public static Fpx One;
         static volatile bool _init;
         static readonly object _initGate = new object();
@@ -861,6 +1166,7 @@ namespace PidKeyPlugIn
                 N0INV = (0x100000000UL - inv) & M;
                 One = one;
                 _rinv = rinv;
+                _pm2Bits = ExpBits.Expand(p - 2);
                 _init = true;                       // ★ 最后才发布
             }
         }
@@ -895,13 +1201,13 @@ namespace PidKeyPlugIn
         /// </summary>
         public static Fpx Inv(in Fpx a)
         {
+            Init();
+            byte[] bits = _pm2Bits;                 // 缓存的 p-2：逐位 BigInteger 移位已去掉
             Fpx r = One, b = a;
-            BigInteger e = Gf.P - 2;
-            while (e > 0)
+            for (int i = 0; i < bits.Length; i++)
             {
-                if (!(e & 1).IsZero) r = Mul(r, b);
+                if (bits[i] != 0) r = Mul(r, b);
                 b = Mul(b, b);
-                e >>= 1;
             }
             return r;
         }
@@ -979,6 +1285,14 @@ namespace PidKeyPlugIn
     {
         // ---- 模加减：limb 表示要求每位 < 2^32，且域里加减必须环绕，不能裸做 ----
         const ulong M32 = 0xFFFFFFFFUL;
+
+        // Montgomery 形式的 0 就是全 0 limb —— 不必再走 FromBig(0)（两次 BigInteger 取模）。
+        static readonly Fpx ZeroX = Fpx.Make(0, 0, 0, 0);
+
+        // 供 TatePairing 等其它类使用的 Fpx 模加减
+        public static Fpx AddX(in Fpx a, in Fpx b) { Fpx r = ZeroX; AddMod(ref r, a, b); return r; }
+        public static Fpx SubX(in Fpx a, in Fpx b) { Fpx r = ZeroX; SubMod(ref r, a, b); return r; }
+        public static Fpx NegX(in Fpx a) { Fpx r = ZeroX; SubMod(ref r, ZeroX, a); return r; }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         static bool GeP(in Fpx a)                       // a >= p ?
@@ -1125,30 +1439,376 @@ namespace PidKeyPlugIn
         public static Fp6m One()
         {
             Fp6m r;
-            Fpx z = Fpm.FromBig(0);
-            r.R.C0 = Fpm.One; r.R.C1 = z; r.R.C2 = z;
-            r.I.C0 = z; r.I.C1 = z; r.I.C2 = z;
+            r.R.C0 = Fpm.One; r.R.C1 = ZeroX; r.R.C2 = ZeroX;
+            r.I.C0 = ZeroX; r.I.C1 = ZeroX; r.I.C2 = ZeroX;
             return r;
+        }
+
+        public static Fp3m One3()
+        {
+            Fp3m r; r.C0 = Fpm.One; r.C1 = ZeroX; r.C2 = ZeroX; return r;
+        }
+
+        /// <summary>Fp3 平方（Chung-Hasan SQR3）：5 次 Fpm.Mul，朴素 Mul3(a,a) 要 6 次。</summary>
+        public static Fp3m Sqr3(in Fp3m a)
+        {
+            Fpx s0 = Fpm.Mul(a.C0, a.C0);
+            Fpx s1 = Dbl(Fpm.Mul(a.C0, a.C1));                  // 2 a0 a1
+            Fpx t = a.C0; SubMod(ref t, t, a.C1); AddMod(ref t, t, a.C2);   // a0 - a1 + a2
+            Fpx s2 = Fpm.Mul(t, t);
+            Fpx s3 = Dbl(Fpm.Mul(a.C1, a.C2));                  // 2 a1 a2
+            Fpx s4 = Fpm.Mul(a.C2, a.C2);
+            // 卷积：t0=s0 t1=s1 t2=s1+s2+s3-s0-s4 t3=s3 t4=s4；u^3 = -4-u 归约同 Mul3
+            Fpx t2 = s1; AddMod(ref t2, t2, s2); AddMod(ref t2, t2, s3);
+            SubMod(ref t2, t2, s0); SubMod(ref t2, t2, s4);
+            Fp3m r;
+            r.C0 = s0; SubMod(ref r.C0, s0, Quad(s3));          // t0 - 4 t3
+            r.C1 = s1; SubMod(ref r.C1, s1, s3); SubMod(ref r.C1, r.C1, Quad(s4));   // t1 - t3 - 4 t4
+            r.C2 = t2; SubMod(ref r.C2, t2, s4);                // t2 - t4
+            return r;
+        }
+
+        /// <summary>Fp6 平方：2 次 Mul3（Mul6(a,a) 要 3 次）。
+        /// r1 = 2 a0 a1，r0 = a0² - 2 a1² = (a0 + a1)(a0 - 2 a1) + a0 a1。</summary>
+        public static Fp6m Sqr6(in Fp6m a)
+        {
+            Fp3m m = Mul3(a.R, a.I);                            // a0 a1
+            Fp3m s = a.R; AddMod(ref s, s, a.I);                // a0 + a1
+            Fp3m w = a.R; SubMod(ref w, w, Dbl3(a.I));          // a0 - 2 a1
+            Fp3m r0 = Mul3(s, w); AddMod(ref r0, r0, m);
+            Fp6m r; r.R = r0; r.I = Dbl3(m);
+            return r;
+        }
+
+        public static Fp6m Add6(in Fp6m a, in Fp6m b)
+        {
+            Fp6m r;
+            r.R.C0 = ZeroX; r.R.C1 = ZeroX; r.R.C2 = ZeroX; r.I.C0 = ZeroX; r.I.C1 = ZeroX; r.I.C2 = ZeroX;
+            AddMod(ref r.R, a.R, b.R); AddMod(ref r.I, a.I, b.I);
+            return r;
+        }
+
+        public static Fp6m Sub6(in Fp6m a, in Fp6m b)
+        {
+            Fp6m r;
+            r.R.C0 = ZeroX; r.R.C1 = ZeroX; r.R.C2 = ZeroX; r.I.C0 = ZeroX; r.I.C1 = ZeroX; r.I.C2 = ZeroX;
+            SubMod(ref r.R, a.R, b.R); SubMod(ref r.I, a.I, b.I);
+            return r;
+        }
+
+        /// <summary>Fp 元素嵌进 Fp6（只有实部第 0 分量）。</summary>
+        public static Fp6m FromFpxEmbedding(in Fpx x)
+        {
+            Fp6m r;
+            r.R.C0 = x; r.R.C1 = ZeroX; r.R.C2 = ZeroX;
+            r.I.C0 = ZeroX; r.I.C1 = ZeroX; r.I.C2 = ZeroX;
+            return r;
+        }
+
+        /// <summary>s * a，s 是基域标量：6 次 Fpm.Mul，比一次完整 Mul6 便宜得多。</summary>
+        public static Fp6m ScaleFp(in Fpx s, in Fp6m a)
+        {
+            Fp6m r;
+            r.R.C0 = Fpm.Mul(s, a.R.C0); r.R.C1 = Fpm.Mul(s, a.R.C1); r.R.C2 = Fpm.Mul(s, a.R.C2);
+            r.I.C0 = Fpm.Mul(s, a.I.C0); r.I.C1 = Fpm.Mul(s, a.I.C1); r.I.C2 = Fpm.Mul(s, a.I.C2);
+            return r;
+        }
+
+        static Fp3m NegC(in Fp3m a)
+        {
+            Fp3m r;
+            r.C0 = NegX(a.C0); r.C1 = NegX(a.C1); r.C2 = NegX(a.C2);
+            return r;
+        }
+
+        /// <summary>x^(p^3)：固定 Fp3，y → -y，即共轭 (c0, -c1)。</summary>
+        public static Fp6m Conj(in Fp6m a)
+        {
+            Fp6m r; r.R = a.R; r.I = NegC(a.I); return r;
         }
 
         public static Fp6m Pow(in Fp6m a, int e)
         {
             Fp6m r = One(), b = a;
-            while (e > 0) { if ((e & 1) != 0) r = Mul6(r, b); b = Mul6(b, b); e >>= 1; }
+            while (e > 0)
+            {
+                if ((e & 1) != 0) r = Mul6(r, b);
+                e >>= 1;
+                if (e > 0) b = Sqr6(b);      // 最后一次平方不会被用到
+            }
             return r;
         }
 
         /// <summary>大指数幂（配对的最终幂要用 658 位的指数）。</summary>
         public static Fp6m PowBig(in Fp6m a, BigInteger e)
         {
+            return PowBigBits(a, ExpBits.Expand(e));
+        }
+
+        /// <summary>a^e，指数已展开成低位在前的位数组：零 BigInteger 分配。</summary>
+        public static Fp6m PowBigBits(in Fp6m a, byte[] bits)
+        {
             Fp6m r = One(), b = a;
-            while (e > 0)
+            for (int i = 0; i < bits.Length; i++)
             {
-                if (!(e & 1).IsZero) r = Mul6(r, b);
-                b = Mul6(b, b);
-                e >>= 1;
+                if (bits[i] != 0) r = Mul6(r, b);
+                b = Sqr6(b);                 // 专用平方，原来是 Mul6(b, b)
             }
             return r;
+        }
+
+        // Fp3 求逆 a^(p^3-2)：指数只跟基域有关，缓存一次位展开。
+        static volatile byte[] _inv3Bits;
+        static readonly object _inv3Gate = new object();
+        static byte[] Inv3Bits()
+        {
+            byte[] b = _inv3Bits;
+            if (b != null) return b;
+            lock (_inv3Gate)
+            {
+                if (_inv3Bits == null)
+                {
+                    BigInteger p = Gf.P;
+                    _inv3Bits = ExpBits.Expand(p * p * p - 2);
+                }
+                return _inv3Bits;
+            }
+        }
+
+        public static Fp3m Inv3(in Fp3m a)
+        {
+            byte[] bits = Inv3Bits();
+            Fp3m r = One3(), b = a;
+            for (int i = 0; i < bits.Length; i++)
+            {
+                if (bits[i] != 0) r = Mul3(r, b);
+                b = Sqr3(b);
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// 最终幂的「易」部分 f^(p^3-1)，不做完整 Fp6 求逆：
+        /// f^-1 = Conj(f)/norm(f)，norm(f) = f·Conj(f) ∈ Fp3，所以
+        /// f^(p^3-1) = Conj(f)·f^-1 = Conj(f)·Conj(f)·norm^-1。
+        /// </summary>
+        public static Fp6m EasyPart(in Fp6m f)
+        {
+            Fp6m cf = Conj(f);
+            Fp6m nf = Mul6(f, cf);                          // 范数在 nf.R，nf.I == 0
+            Fp3m ninv = Inv3(nf.R);
+            Fp6m finv; finv.R = Mul3(cf.R, ninv); finv.I = Mul3(cf.I, ninv);
+            return Mul6(cf, finv);
+        }
+
+        /// <summary>f^((p^6-1)/n) = (f^(p^3-1))^((p^3+1)/n)，hardBits = (p^3+1)/n 的位展开。</summary>
+        public static Fp6m FinalExpBits(in Fp6m f, byte[] hardBits)
+        {
+            return PowBigBits(EasyPart(f), hardBits);
+        }
+
+        // =====================================================================
+        //  MITM 只需要每个乘积的**哈希**（只看第一个 GF(p) 坐标），整个乘积只在
+        //  哈希命中后才重算。Fp6 = Fp3[y]/(y²+2)，Fp3 = Fp[u]/(u³+u+4)，z = x·y 的
+        //  第一个坐标是
+        //      z.R.C0 =  xR0·yR0 − 4(xR1·yR2 + xR2·yR1)
+        //              − 2·xI0·yI0 + 8(xI1·yI2 + xI2·yI1)
+        //  把常数先折进 y（DotForm，一次），每个表项就是 6 个乘积累加 + 1 次归约，
+        //  而不是一整个 Mul6（18 次 Fpm.Mul = 18 次归约 + Karatsuba 的加减）。
+        // =====================================================================
+        public struct Dot6 { public Fpx W0, W1, W2, W3, W4, W5; }
+
+        public static Dot6 DotForm(in Fp6m y)
+        {
+            Dot6 d;
+            d.W0 = y.R.C0;
+            d.W1 = NegX(Quad(y.R.C2));              // -4 * yR2
+            d.W2 = NegX(Quad(y.R.C1));              // -4 * yR1
+            d.W3 = NegX(Dbl(y.I.C0));               // -2 * yI0
+            d.W4 = Dbl(Quad(y.I.C2));               //  8 * yI2
+            d.W5 = Dbl(Quad(y.I.C1));               //  8 * yI1
+            return d;
+        }
+
+        /// <summary>
+        /// (x * y).R.C0 as a canonical Montgomery element, for d = DotForm(y):
+        /// six 128x128-bit products summed UNREDUCED, then ONE Montgomery reduction,
+        /// instead of a whole Mul6 (18 Fpm.Mul = 18 reductions). Sum < 6p^2 < 2^224,
+        /// below p*R = p*2^128, which is what the reduction requires.
+        /// </summary>
+        public static Fpx DotCoord(in Fp6m x, in Dot6 d)
+        {
+            const ulong M = 0xFFFFFFFFUL;
+            ulong c0 = 0, c1 = 0, c2 = 0, c3 = 0, c4 = 0, c5 = 0, c6 = 0, c7 = 0, q;
+            ulong a0, a1, a2, a3, b0, b1, b2, b3;
+            // term 0
+            a0 = x.R.C0.A0; a1 = x.R.C0.A1; a2 = x.R.C0.A2; a3 = x.R.C0.A3;
+            b0 = d.W0.A0; b1 = d.W0.A1; b2 = d.W0.A2; b3 = d.W0.A3;
+            q = a0 * b0; c0 += q & M; c1 += q >> 32;
+            q = a0 * b1; c1 += q & M; c2 += q >> 32;
+            q = a0 * b2; c2 += q & M; c3 += q >> 32;
+            q = a0 * b3; c3 += q & M; c4 += q >> 32;
+            q = a1 * b0; c1 += q & M; c2 += q >> 32;
+            q = a1 * b1; c2 += q & M; c3 += q >> 32;
+            q = a1 * b2; c3 += q & M; c4 += q >> 32;
+            q = a1 * b3; c4 += q & M; c5 += q >> 32;
+            q = a2 * b0; c2 += q & M; c3 += q >> 32;
+            q = a2 * b1; c3 += q & M; c4 += q >> 32;
+            q = a2 * b2; c4 += q & M; c5 += q >> 32;
+            q = a2 * b3; c5 += q & M; c6 += q >> 32;
+            q = a3 * b0; c3 += q & M; c4 += q >> 32;
+            q = a3 * b1; c4 += q & M; c5 += q >> 32;
+            q = a3 * b2; c5 += q & M; c6 += q >> 32;
+            q = a3 * b3; c6 += q & M; c7 += q >> 32;
+            // term 1
+            a0 = x.R.C1.A0; a1 = x.R.C1.A1; a2 = x.R.C1.A2; a3 = x.R.C1.A3;
+            b0 = d.W1.A0; b1 = d.W1.A1; b2 = d.W1.A2; b3 = d.W1.A3;
+            q = a0 * b0; c0 += q & M; c1 += q >> 32;
+            q = a0 * b1; c1 += q & M; c2 += q >> 32;
+            q = a0 * b2; c2 += q & M; c3 += q >> 32;
+            q = a0 * b3; c3 += q & M; c4 += q >> 32;
+            q = a1 * b0; c1 += q & M; c2 += q >> 32;
+            q = a1 * b1; c2 += q & M; c3 += q >> 32;
+            q = a1 * b2; c3 += q & M; c4 += q >> 32;
+            q = a1 * b3; c4 += q & M; c5 += q >> 32;
+            q = a2 * b0; c2 += q & M; c3 += q >> 32;
+            q = a2 * b1; c3 += q & M; c4 += q >> 32;
+            q = a2 * b2; c4 += q & M; c5 += q >> 32;
+            q = a2 * b3; c5 += q & M; c6 += q >> 32;
+            q = a3 * b0; c3 += q & M; c4 += q >> 32;
+            q = a3 * b1; c4 += q & M; c5 += q >> 32;
+            q = a3 * b2; c5 += q & M; c6 += q >> 32;
+            q = a3 * b3; c6 += q & M; c7 += q >> 32;
+            // term 2
+            a0 = x.R.C2.A0; a1 = x.R.C2.A1; a2 = x.R.C2.A2; a3 = x.R.C2.A3;
+            b0 = d.W2.A0; b1 = d.W2.A1; b2 = d.W2.A2; b3 = d.W2.A3;
+            q = a0 * b0; c0 += q & M; c1 += q >> 32;
+            q = a0 * b1; c1 += q & M; c2 += q >> 32;
+            q = a0 * b2; c2 += q & M; c3 += q >> 32;
+            q = a0 * b3; c3 += q & M; c4 += q >> 32;
+            q = a1 * b0; c1 += q & M; c2 += q >> 32;
+            q = a1 * b1; c2 += q & M; c3 += q >> 32;
+            q = a1 * b2; c3 += q & M; c4 += q >> 32;
+            q = a1 * b3; c4 += q & M; c5 += q >> 32;
+            q = a2 * b0; c2 += q & M; c3 += q >> 32;
+            q = a2 * b1; c3 += q & M; c4 += q >> 32;
+            q = a2 * b2; c4 += q & M; c5 += q >> 32;
+            q = a2 * b3; c5 += q & M; c6 += q >> 32;
+            q = a3 * b0; c3 += q & M; c4 += q >> 32;
+            q = a3 * b1; c4 += q & M; c5 += q >> 32;
+            q = a3 * b2; c5 += q & M; c6 += q >> 32;
+            q = a3 * b3; c6 += q & M; c7 += q >> 32;
+            // term 3
+            a0 = x.I.C0.A0; a1 = x.I.C0.A1; a2 = x.I.C0.A2; a3 = x.I.C0.A3;
+            b0 = d.W3.A0; b1 = d.W3.A1; b2 = d.W3.A2; b3 = d.W3.A3;
+            q = a0 * b0; c0 += q & M; c1 += q >> 32;
+            q = a0 * b1; c1 += q & M; c2 += q >> 32;
+            q = a0 * b2; c2 += q & M; c3 += q >> 32;
+            q = a0 * b3; c3 += q & M; c4 += q >> 32;
+            q = a1 * b0; c1 += q & M; c2 += q >> 32;
+            q = a1 * b1; c2 += q & M; c3 += q >> 32;
+            q = a1 * b2; c3 += q & M; c4 += q >> 32;
+            q = a1 * b3; c4 += q & M; c5 += q >> 32;
+            q = a2 * b0; c2 += q & M; c3 += q >> 32;
+            q = a2 * b1; c3 += q & M; c4 += q >> 32;
+            q = a2 * b2; c4 += q & M; c5 += q >> 32;
+            q = a2 * b3; c5 += q & M; c6 += q >> 32;
+            q = a3 * b0; c3 += q & M; c4 += q >> 32;
+            q = a3 * b1; c4 += q & M; c5 += q >> 32;
+            q = a3 * b2; c5 += q & M; c6 += q >> 32;
+            q = a3 * b3; c6 += q & M; c7 += q >> 32;
+            // term 4
+            a0 = x.I.C1.A0; a1 = x.I.C1.A1; a2 = x.I.C1.A2; a3 = x.I.C1.A3;
+            b0 = d.W4.A0; b1 = d.W4.A1; b2 = d.W4.A2; b3 = d.W4.A3;
+            q = a0 * b0; c0 += q & M; c1 += q >> 32;
+            q = a0 * b1; c1 += q & M; c2 += q >> 32;
+            q = a0 * b2; c2 += q & M; c3 += q >> 32;
+            q = a0 * b3; c3 += q & M; c4 += q >> 32;
+            q = a1 * b0; c1 += q & M; c2 += q >> 32;
+            q = a1 * b1; c2 += q & M; c3 += q >> 32;
+            q = a1 * b2; c3 += q & M; c4 += q >> 32;
+            q = a1 * b3; c4 += q & M; c5 += q >> 32;
+            q = a2 * b0; c2 += q & M; c3 += q >> 32;
+            q = a2 * b1; c3 += q & M; c4 += q >> 32;
+            q = a2 * b2; c4 += q & M; c5 += q >> 32;
+            q = a2 * b3; c5 += q & M; c6 += q >> 32;
+            q = a3 * b0; c3 += q & M; c4 += q >> 32;
+            q = a3 * b1; c4 += q & M; c5 += q >> 32;
+            q = a3 * b2; c5 += q & M; c6 += q >> 32;
+            q = a3 * b3; c6 += q & M; c7 += q >> 32;
+            // term 5
+            a0 = x.I.C2.A0; a1 = x.I.C2.A1; a2 = x.I.C2.A2; a3 = x.I.C2.A3;
+            b0 = d.W5.A0; b1 = d.W5.A1; b2 = d.W5.A2; b3 = d.W5.A3;
+            q = a0 * b0; c0 += q & M; c1 += q >> 32;
+            q = a0 * b1; c1 += q & M; c2 += q >> 32;
+            q = a0 * b2; c2 += q & M; c3 += q >> 32;
+            q = a0 * b3; c3 += q & M; c4 += q >> 32;
+            q = a1 * b0; c1 += q & M; c2 += q >> 32;
+            q = a1 * b1; c2 += q & M; c3 += q >> 32;
+            q = a1 * b2; c3 += q & M; c4 += q >> 32;
+            q = a1 * b3; c4 += q & M; c5 += q >> 32;
+            q = a2 * b0; c2 += q & M; c3 += q >> 32;
+            q = a2 * b1; c3 += q & M; c4 += q >> 32;
+            q = a2 * b2; c4 += q & M; c5 += q >> 32;
+            q = a2 * b3; c5 += q & M; c6 += q >> 32;
+            q = a3 * b0; c3 += q & M; c4 += q >> 32;
+            q = a3 * b1; c4 += q & M; c5 += q >> 32;
+            q = a3 * b2; c5 += q & M; c6 += q >> 32;
+            q = a3 * b3; c6 += q & M; c7 += q >> 32;
+            // carry-propagate the column sums into eight 32-bit limbs
+            ulong t0, t1, t2, t3, t4, t5, t6, t7, cy;
+            t0 = c0 & M; cy = c0 >> 32;
+            c1 += cy; t1 = c1 & M; cy = c1 >> 32;
+            c2 += cy; t2 = c2 & M; cy = c2 >> 32;
+            c3 += cy; t3 = c3 & M; cy = c3 >> 32;
+            c4 += cy; t4 = c4 & M; cy = c4 >> 32;
+            c5 += cy; t5 = c5 & M; cy = c5 >> 32;
+            c6 += cy; t6 = c6 & M; cy = c6 >> 32;
+            c7 += cy; t7 = c7 & M; cy = c7 >> 32;
+            // Montgomery reduction (R = 2^128): four rounds, low limb drops out
+            ulong m;
+            m = (t0 * Fpm.N0INV) & M;
+            q = m * Fpm.PB0_ + t0; cy = q >> 32;
+            q = m * Fpm.PB1_ + t1 + cy; t1 = q & M; cy = q >> 32;
+            q = m * Fpm.PB2_ + t2 + cy; t2 = q & M; cy = q >> 32;
+            q = m * Fpm.PB3_ + t3 + cy; t3 = q & M; cy = q >> 32;
+            q = t4 + cy; t4 = q & M; cy = q >> 32;
+            q = t5 + cy; t5 = q & M; cy = q >> 32;
+            q = t6 + cy; t6 = q & M; cy = q >> 32;
+            q = t7 + cy; t7 = q & M; cy = q >> 32;
+            m = (t1 * Fpm.N0INV) & M;
+            q = m * Fpm.PB0_ + t1; cy = q >> 32;
+            q = m * Fpm.PB1_ + t2 + cy; t2 = q & M; cy = q >> 32;
+            q = m * Fpm.PB2_ + t3 + cy; t3 = q & M; cy = q >> 32;
+            q = m * Fpm.PB3_ + t4 + cy; t4 = q & M; cy = q >> 32;
+            q = t5 + cy; t5 = q & M; cy = q >> 32;
+            q = t6 + cy; t6 = q & M; cy = q >> 32;
+            q = t7 + cy; t7 = q & M; cy = q >> 32;
+            m = (t2 * Fpm.N0INV) & M;
+            q = m * Fpm.PB0_ + t2; cy = q >> 32;
+            q = m * Fpm.PB1_ + t3 + cy; t3 = q & M; cy = q >> 32;
+            q = m * Fpm.PB2_ + t4 + cy; t4 = q & M; cy = q >> 32;
+            q = m * Fpm.PB3_ + t5 + cy; t5 = q & M; cy = q >> 32;
+            q = t6 + cy; t6 = q & M; cy = q >> 32;
+            q = t7 + cy; t7 = q & M; cy = q >> 32;
+            m = (t3 * Fpm.N0INV) & M;
+            q = m * Fpm.PB0_ + t3; cy = q >> 32;
+            q = m * Fpm.PB1_ + t4 + cy; t4 = q & M; cy = q >> 32;
+            q = m * Fpm.PB2_ + t5 + cy; t5 = q & M; cy = q >> 32;
+            q = m * Fpm.PB3_ + t6 + cy; t6 = q & M; cy = q >> 32;
+            q = t7 + cy; t7 = q & M; cy = q >> 32;
+            // result = t4..t7, < 2p: one conditional subtraction
+            if (t7 > Fpm.PB3_
+                || (t7 == Fpm.PB3_ && (t6 > Fpm.PB2_
+                || (t6 == Fpm.PB2_ && (t5 > Fpm.PB1_ || (t5 == Fpm.PB1_ && t4 >= Fpm.PB0_))))))
+            {
+                long cb, qq;
+                qq = (long)t4 - (long)Fpm.PB0_; t4 = (ulong)qq & M; cb = qq >> 32;
+                qq = (long)t5 - (long)Fpm.PB1_ + cb; t5 = (ulong)qq & M; cb = qq >> 32;
+                qq = (long)t6 - (long)Fpm.PB2_ + cb; t6 = (ulong)qq & M; cb = qq >> 32;
+                qq = (long)t7 - (long)Fpm.PB3_ + cb; t7 = (ulong)qq & M;
+            }
+            return Fpx.Make(t4, t5, t6, t7);
         }
 
         public static Fp6 ToFp6(in Fp6m a)
@@ -1188,12 +1848,11 @@ namespace PidKeyPlugIn
     public static class H1Search
     {
         /// <summary>摘要：对 Fp6m 第一个 GF(p) 分量的 4 个 limb 跑 sa_checksum4。
-        /// 用的就是 Montgomery 形式的 limb —— 一致性只要求两侧相同，不必等于规范形式。</summary>
+        /// 用的就是 Montgomery 形式的 limb —— 一致性只要求两侧相同，不必等于规范形式。
+        /// （保留给外部调用；新的 Solve 用 HashX。）</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static uint HashM(in Fp6m v)
         {
-            // 展开 sa_checksum4 且**不做任何分配** —— 建表要跑 52 万次，
-            // 每次 new 一个 uint[] 加一个 byte[] 就是 100 万次堆分配，GC 会吃掉大半时间。
             uint w0 = (uint)v.R.C0.A0, w1 = (uint)v.R.C0.A1,
                  w2 = (uint)v.R.C0.A2, w3 = (uint)v.R.C0.A3;
             uint v4 = 0, b0, b1, b2, b3;
@@ -1204,75 +1863,212 @@ namespace PidKeyPlugIn
             return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
         }
 
-        static Fp6m ProdM(Fp6m[] g, int[] lo, int[] hi, int from, int to, long s, out int[] digs)
+        /// <summary>单个 GF(p) 元素（4 个 limb）的 32 位哈希。建表侧和扫描侧用同一个函数即可。</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static uint HashX(in Fpx v)
         {
-            digs = new int[to - from + 1];
-            Fp6m v = Fp6mOp.One();
-            long t = s;
-            for (int i = 0; i <= to - from; i++)
+            unchecked
             {
-                int radix = hi[from + i] - lo[from + i] + 1;
-                int d = (int)(t % radix); t /= radix;
-                digs[i] = d;
-                v = Fp6mOp.Mul6(v, Fp6mOp.Pow(g[from + i], lo[from + i] + d));
+                ulong mix = v.A0 ^ (v.A1 * 0x9E3779B97F4A7C15UL)
+                                 ^ (v.A2 * 0xC2B2AE3D27D4EB4FUL)
+                                 ^ (v.A3 * 0x165667B19E3779F9UL);
+                mix ^= mix >> 33;
+                mix *= 0xff51afd7ed558ccdUL;
+                mix ^= mix >> 33;
+                return (uint)(mix ^ (mix >> 32));
             }
-            return v;
+        }
+
+        /// <summary>置 1 后所有进行中的 Solve 会尽快退出（供多候选并行时用：
+        /// 某个候选命中后，其它候选不必把整个 MITM 跑完）。</summary>
+        public static int Abort;
+
+        // 旧版诊断计数器，保留字段以免 bench 代码编译失败；新实现不再更新它们。
+        public static long ProbeCalls, ProbeHashHits;
+        public static double ProbeProdMms;
+
+        // 一个下标范围里的取值个数（混合进制）
+        static long SpanSize(int[] lo, int[] hi, int from, int to)
+        {
+            long size = 1;
+            for (int k = from; k <= to; k++) size *= (hi[k] - lo[k] + 1);
+            return size;
+        }
+
+        // from..to 里前面多少位放进「低」表，使 低表 + 高表（要用真 Mul6 建的两张小表）最小。
+        static int BalancedSplit(int[] lo, int[] hi, int from, int to)
+        {
+            int best = 0;
+            long bestCost = -1;
+            for (int k = 0; k <= to - from + 1; k++)
+            {
+                long cost = SpanSize(lo, hi, from, from + k - 1) + SpanSize(lo, hi, from + k, to);
+                if (bestCost < 0 || cost < bestCost) { bestCost = cost; best = k; }
+            }
+            return best;
+        }
+
+        // out[s] = bas · Π gen[from+i]^(lo[from+i] + digit_i(s))，s 的数字是混合进制，
+        // 位置 from 变化最快（与 ProdM 同一编号）。用「里程计」推进，每项约 1 次 Mul6。
+        // genInv 是 gen 的逆元。
+        static Fp6m[] FillProducts(Fp6m bas, Fp6m[] gen, Fp6m[] genInv,
+                                   int[] lo, int[] hi, int from, int to)
+        {
+            int cnt = to - from + 1;                 // 可以为 0 → 单个元素
+            long size = SpanSize(lo, hi, from, to);
+            Fp6m[] outp = new Fp6m[size];
+            int w = Math.Max(cnt, 1);
+            Fp6m[] wrap = new Fp6m[w];
+            int[] span = new int[w], dg = new int[w];
+            Fp6m prod = bas;
+            for (int i = 0; i < cnt; i++)
+            {
+                span[i] = hi[from + i] - lo[from + i];
+                dg[i] = 0;
+                prod = Fp6mOp.Mul6(prod, Fp6mOp.Pow(gen[from + i], lo[from + i]));
+                wrap[i] = Fp6mOp.Pow(genInv[from + i], span[i]);
+            }
+            for (long s = 0; ;)
+            {
+                outp[s] = prod;
+                if (++s == size) break;
+                for (int i = 0; i < cnt; i++)
+                {
+                    if (span[i] == 0) continue;
+                    if (dg[i] < span[i]) { dg[i]++; prod = Fp6mOp.Mul6(prod, gen[from + i]); break; }
+                    dg[i] = 0;
+                    prod = Fp6mOp.Mul6(prod, wrap[i]);
+                }
+            }
+            return outp;
+        }
+
+        // 把下标 s 的各位数字（lo + digit）写进 solution[order[位置]]
+        static void DecodeDigits(int[] solution, int[] order, int[] lo, int[] hi,
+                                 int from, int to, long s)
+        {
+            for (int k = from; k <= to; k++)
+            {
+                int radix = hi[k] - lo[k] + 1;
+                solution[order[k]] = lo[k] + (int)(s % radix);
+                s /= radix;
+            }
+        }
+
+        // ---- 按线程复用的缓冲：建表侧 key、哈希表（带代数戳，免得每次 4MB 清零）、
+        //      过滤位图。命中前绝大多数探测在过滤位图（512KB，进 L2）就被挡掉。
+        [ThreadStatic] static ulong[] _keysBuf;
+        [ThreadStatic] static int[] _valTbl;
+        [ThreadStatic] static uint[] _stampTbl;
+        [ThreadStatic] static uint _gen;
+        [ThreadStatic] static ulong[] _filterBuf;
+        const int TableBits = 20;
+        const int TableSize = 1 << TableBits;
+        const int TableMask = TableSize - 1;
+        const int FilterWords = (1 << 22) / 64;
+
+        sealed class Ctx
+        {
+            public ulong[] Keys; public int[] Val; public uint[] Stamp; public uint Gen;
+            public ulong[] Filter;
+            public Fp6m[] RLo, RHi, LHi;
+            public long RLow;
+            public int[] Order, LoP, HiP;
+            public int N, R0, R1, L0, L1;
+        }
+
+        // fh = xLow·LHi[j] 第一个坐标的哈希。只有 32 位哈希命中才真正算两个完整乘积比较。
+        static bool Probe(Ctx c, uint fh, Fp6m xLow, long j, long s, int[] solOut)
+        {
+            uint bit = fh >> 10;
+            if (((c.Filter[bit >> 6] >> (int)(bit & 63)) & 1UL) == 0) return false;
+            int idx = (int)(fh & TableMask);
+            while (c.Stamp[idx] == c.Gen)
+            {
+                long pp = c.Val[idx];
+                if ((uint)(c.Keys[pp] >> 32) == fh)
+                {
+                    long rs = (long)(uint)c.Keys[pp];
+                    Fp6m rv = Fp6mOp.Mul6(c.RLo[(int)(rs % c.RLow)], c.RHi[(int)(rs / c.RLow)]);
+                    Fp6m needed = Fp6mOp.Mul6(xLow, c.LHi[(int)j]);
+                    if (rv.Eq(needed))
+                    {
+                        for (int i = 0; i < solOut.Length; i++) solOut[i] = 0;
+                        DecodeDigits(solOut, c.Order, c.LoP, c.HiP, c.R0, c.R1, rs);
+                        DecodeDigits(solOut, c.Order, c.LoP, c.HiP, c.L0, c.L1, s);
+                        return true;
+                    }
+                }
+                idx = (idx + 1) & TableMask;
+            }
+            return false;
+        }
+
+        static void RunChunks(int nth, long total, Action<long, long> body)
+        {
+            int nchunk = Math.Max(1, nth);
+            if (nchunk == 1) { body(0, total); return; }
+            long chunk = (total + nchunk - 1) / nchunk;
+            System.Threading.Tasks.Parallel.For(0, nchunk, c =>
+            {
+                long begin = (long)c * chunk;
+                long end = Math.Min(begin + chunk, total);
+                if (begin < end) body(begin, end);
+            });
         }
 
         /// <summary>返回 h[0..n-1]，失败返回 null。</summary>
         /// <param name="threads">0 = 自动（核数）；1 = 单线程。
         /// 外层已经在按候选并行时传 1 —— 两层并行会在 4 物理核上超订，实测慢 3 倍。</param>
-        /// <summary>置 1 后所有进行中的 Solve 会尽快退出（供多候选并行时用：
-        /// 某个候选命中后，其它候选不必把整个 MITM 跑完）。</summary>
-        public static int Abort;
-
-        // ---- 诊断计数器：只在 bench 里读。单候选跑的时候是单线程（nth=1），
-        //      所以普通静态字段就够，不加锁。
-        public static long ProbeCalls, ProbeHashHits;
-        public static double ProbeProdMms;
-
         public static int[] Solve(Fp6[] g, Fp6 target, int[] lo, int[] hi, out string note,
                                   int threads = 0)
         {
             Abort = 0;
+            int[] cancelBox = CancelFlag.Box;              // captured here: the chunk lambdas may run on other threads
             int n = lo.Length;
+            // 下面的 order 与左右劈分是为 14 个基写死的；别的形状会越界，所以直接拒绝。
+            if (n != 14 || hi.Length != n || g.Length != n) { note = "unsupported key shape"; return null; }
             int nth = threads > 0 ? threads : Environment.ProcessorCount;
             Fpm.Init();
 
-            // 批量求逆（Montgomery 技巧）：1 次求逆 + 3n 次乘法，代替 n 次求逆。
-            // 这一小段仍在 BigInteger 侧做 —— 只 14 个，代价可忽略。
-            var ginv = new Fp6[n];
+            // ---- 生成元、它们的逆元、两个目标 --------------------------------------
+            // 配对输出是酉元（最终幂含因子 p^3-1），酉元的逆就是共轭 (c0, -c1)：
+            // 把 BigInteger 版 Fp6 求逆（Fermat，~1000 次 Fp6 乘法 ×2）换成符号翻转。
+            // 每个共轭用一次 Mul6 验证；只要有一个不是酉元就走旧的求逆路径，结果对任何输入都相同。
+            Fp6m oneM = Fp6mOp.One();
+            Fp6m[] gm = new Fp6m[n], gim = new Fp6m[n];
+            bool unitary = true;
+            for (int k = 0; k < n; k++)
             {
-                var pref = new Fp6[n + 1];
+                gm[k] = Fp6m.FromFp6(g[k]);
+                gim[k] = Fp6mOp.Conj(gm[k]);
+                if (!Fp6mOp.Mul6(gm[k], gim[k]).Eq(oneM)) unitary = false;
+            }
+            Fp6m tgt = Fp6m.FromFp6(target);
+            Fp6m tgtI = Fp6mOp.Conj(tgt);
+            if (!Fp6mOp.Mul6(tgt, tgtI).Eq(oneM)) unitary = false;
+
+            if (!unitary)
+            {
+                // 批量求逆（Montgomery 技巧）：1 次求逆 + 3n 次乘法，代替 n 次求逆。
+                Fp6[] pref = new Fp6[n + 1];
                 pref[0] = Fp6.One;
                 for (int k = 0; k < n; k++) pref[k + 1] = pref[k] * g[k];
                 Fp6 acc = pref[n].Inverse();
                 for (int k = n - 1; k >= 0; k--)
                 {
-                    ginv[k] = acc * pref[k];
+                    gim[k] = Fp6m.FromFp6(acc * pref[k]);
                     acc = acc * g[k];
                 }
+                tgtI = Fp6m.FromFp6(Fp6.One / target);
             }
 
-            // 转 Montgomery 形式，之后整个 MITM 都在定长 limb 上跑（零堆分配）
-            var gm = new Fp6m[n];
-            var gim = new Fp6m[n];
-            for (int k = 0; k < n; k++) { gm[k] = Fp6m.FromFp6(g[k]); gim[k] = Fp6m.FromFp6(ginv[k]); }
-            Fp6m tgt = Fp6m.FromFp6(target);
-
-            // ---------- 分裂点：按**数字值**而不是下标来分 ----------
-            // 原来按下标分：建表侧 4*4*4*4*4*8*64 = 2^19、扫描侧 2^17，
-            // 而 k=0,1,2 的进制是 1（固定值，没有自由度，白占位置）。
-            // 重排成 16*16*16*64 = 2^18 与 32*4*4*4*4*4*8 = 2^18 —— 两边平衡。
-            // 失败的候选要跑满整个 MITM，所以这一步直接省掉 20% 的工作量，
-            // 而且省下来的大头是**不能并行**的建表那一半。
-            int[] order = { 0, 1, 2, 3, 4, 5, 13, 6, 7, 8, 9, 10, 11, 12 };
-            var loP = new int[n];
-            var hiP = new int[n];
+            // ---------- 分裂点：按数字值而不是下标来分 ----------
+            // 重排成 16*16*16*64 = 2^18 与 32*4*4*4*4*4*8 = 2^18，两边平衡。
             // ★ 生成元也一起重排 —— 位置 i 对应的是 g[order[i]]，不是 g[i]。
-            //   漏了这一步会一直算不出解（踩过）。
-            var gmP = new Fp6m[n];
-            var gimP = new Fp6m[n];
+            int[] order = { 0, 1, 2, 3, 4, 5, 13, 6, 7, 8, 9, 10, 11, 12 };
+            int[] loP = new int[n], hiP = new int[n];
+            Fp6m[] gmP = new Fp6m[n], gimP = new Fp6m[n];
             for (int i = 0; i < n; i++)
             {
                 loP[i] = lo[order[i]]; hiP[i] = hi[order[i]];
@@ -1280,181 +2076,117 @@ namespace PidKeyPlugIn
             }
 
             // ---------- 建表侧（重排后的 0..6）----------
+            // rv(i + rLow·j) = RLo[i] · RHi[j]。只用真 Mul6 建两张小表，
+            // 2^18 个乘积本身从不成形 —— 只算第一个坐标（点积 + 一次归约）。
             const int R0 = 0, R1 = 6;
-            int rn = R1 - R0 + 1;
-            long rsize = 1;
-            for (int k = R0; k <= R1; k++) rsize *= (hiP[k] - loP[k] + 1);
-            // ★ 固定位（hi == lo，范围 1）没有自由度，但里程计每步都会对它走一次
-            //   "回绕"分支，乘一次 rwrap = g^(hi-lo) = g^0 = **单位元** —— 纯浪费。
-            //   建表侧 7 位里有 3 位是固定位 ⇒ 每步 4 次 Mul6 里 3 次白做。
-            //   只遍历真正有自由度的位，每步恰好 1 次 Mul6。
-            var _actR = new System.Collections.Generic.List<int>();
-            for (int i = 0; i < rn; i++) if (hiP[R0 + i] > loP[R0 + i]) _actR.Add(i);
-            int[] actR = _actR.ToArray();
+            long rsize = SpanSize(loP, hiP, R0, R1);
+            int rSplit = BalancedSplit(loP, hiP, R0, R1);
+            Fp6m[] RLo = FillProducts(oneM, gmP, gimP, loP, hiP, R0, R0 + rSplit - 1);
+            Fp6m[] RHi = FillProducts(oneM, gmP, gimP, loP, hiP, R0 + rSplit, R1);
+            long rLow = RLo.Length, rHigh = RHi.Length;
+            Fp6mOp.Dot6[] RHiDot = new Fp6mOp.Dot6[rHigh];
+            for (long j = 0; j < rHigh; j++) RHiDot[j] = Fp6mOp.DotForm(RHi[j]);
 
-            var rwrap = new Fp6m[rn];
-            for (int i = 0; i < rn; i++) rwrap[i] = Fp6mOp.Pow(gimP[R0 + i], hiP[R0 + i] - loP[R0 + i]);
+            if (_keysBuf == null || _keysBuf.Length < rsize) _keysBuf = new ulong[rsize];
+            ulong[] keys = _keysBuf;
 
-            var keys = new ulong[rsize];
-            var swBuild = System.Diagnostics.Stopwatch.StartNew();
-            // 并行建表：里程计本身是串行的（每步依赖上一步），但可以按**块**切开，
-            // 每块用 ProdM 直接算出自己的起始乘积，再在块内跑里程计。块数 = 核数。
+            RunChunks(nth, rHigh, (begin, end) =>
             {
-                int nchunk = Math.Max(1, nth);
-                long chunk = (rsize + nchunk - 1) / nchunk;
-                System.Threading.Tasks.Parallel.For(0, nchunk, c =>
+                for (long j = begin; j < end; j++)
                 {
-                    long begin = (long)c * chunk;
-                    long end = Math.Min(begin + chunk, rsize);
-                    if (begin >= end) return;
-                    int[] d0;
-                    Fp6m prod = ProdM(gmP, loP, hiP, R0, R1, begin, out d0);
-                    var dg = (int[])d0.Clone();
-                    for (long s = begin; s < end; s++)
-                    {
-                        if ((s & 0x3FF) == 0 && System.Threading.Volatile.Read(ref Abort) != 0) return;
-                        keys[s] = ((ulong)HashM(prod) << 32) | (ulong)s;
-                        for (int _j = 0; _j < actR.Length; _j++)
-                        {
-                            int i = actR[_j];
-                            if (dg[i] < hiP[R0 + i] - loP[R0 + i])
-                            { dg[i]++; prod = Fp6mOp.Mul6(prod, gmP[R0 + i]); break; }
-                            dg[i] = 0; prod = Fp6mOp.Mul6(prod, rwrap[i]);
-                        }
-                    }
-                });
+                    if ((System.Threading.Volatile.Read(ref Abort) != 0 || CancelFlag.IsSet(cancelBox))) return;
+                    long baseIdx = j * rLow;
+                    for (long i = 0; i < rLow; i++)
+                        keys[baseIdx + i] = ((ulong)HashX(Fp6mOp.DotCoord(RLo[i], RHiDot[j])) << 32)
+                                            | (ulong)(baseIdx + i);
+                }
+            });
+
+            // 别的候选已经赢了：建表 + 全扫都是白费
+            if ((System.Threading.Volatile.Read(ref Abort) != 0 || CancelFlag.IsSet(cancelBox))) { note = "aborted"; return null; }
+
+            // ---------- 开放寻址哈希表（线性探测）+ 过滤位图 ----------
+            if (_valTbl == null) { _valTbl = new int[TableSize]; _stampTbl = new uint[TableSize]; _gen = 0; }
+            if (++_gen == 0) { Array.Clear(_stampTbl, 0, _stampTbl.Length); _gen = 1; }
+            if (_filterBuf == null) _filterBuf = new ulong[FilterWords];
+            else Array.Clear(_filterBuf, 0, FilterWords);
+
+            int[] valTbl = _valTbl;
+            uint[] stampTbl = _stampTbl;
+            uint gen = _gen;
+            ulong[] filterBuf = _filterBuf;
+            for (long i = 0; i < rsize; i++)
+            {
+                uint fullHash = (uint)(keys[i] >> 32);
+                uint bit = fullHash >> 10;                          // 高 22 位
+                filterBuf[bit >> 6] |= 1UL << (int)(bit & 63);
+                int idx = (int)(fullHash & TableMask);
+                while (stampTbl[idx] == gen) idx = (idx + 1) & TableMask;
+                stampTbl[idx] = gen;
+                valTbl[idx] = (int)i;
             }
-            Array.Sort(keys);
 
             // ---------- 扫描侧（重排后的 7..13）----------
+            // needed(i + lLow·j) = LLoA[i] · LHi[j]（目标折进低表），LLoB 对应逆目标。
             const int L0 = 7, L1 = 13;
-            int ln = L1 - L0 + 1;
-            long lsize = 1;
-            for (int k = L0; k <= L1; k++) lsize *= (hiP[k] - loP[k] + 1);
-            var _actL = new System.Collections.Generic.List<int>();
-            for (int i = 0; i < ln; i++) if (hiP[L0 + i] > loP[L0 + i]) _actL.Add(i);
-            int[] actL = _actL.ToArray();
+            int lSplit = BalancedSplit(loP, hiP, L0, L1);
+            if (CancelFlag.IsSet(cancelBox)) { note = "aborted"; return null; }
+            Fp6m[] LLoA = FillProducts(tgt, gimP, gmP, loP, hiP, L0, L0 + lSplit - 1);
+            Fp6m[] LLoB = FillProducts(tgtI, gimP, gmP, loP, hiP, L0, L0 + lSplit - 1);
+            Fp6m[] LHi = FillProducts(oneM, gimP, gmP, loP, hiP, L0 + lSplit, L1);
+            long lLow = LLoA.Length, lHigh = LHi.Length;
+            Fp6mOp.Dot6[] LHiDot = new Fp6mOp.Dot6[lHigh];
+            for (long j = 0; j < lHigh; j++) LHiDot[j] = Fp6mOp.DotForm(LHi[j]);
 
-            var lwrap = new Fp6m[ln];
-            var lwrapi = new Fp6m[ln];
-            for (int i = 0; i < ln; i++)
-            {
-                // 回绕：该位从 (hi-lo) 归零，乘积要**除掉** g^(hi-lo) ⇒ 乘它的逆
-                lwrap[i] = Fp6mOp.Pow(gimP[L0 + i], hiP[L0 + i] - loP[L0 + i]);
-                lwrapi[i] = Fp6mOp.Pow(gmP[L0 + i], hiP[L0 + i] - loP[L0 + i]);
-            }
+            // 线程静态的缓冲不会被 lambda 捕获（会解析成「执行 lambda 的那个线程」的实例），
+            // 所以把调用线程的引用拍下来，工作线程只用这些局部变量。
+            Ctx ctx = new Ctx();
+            ctx.Keys = keys; ctx.Val = valTbl; ctx.Stamp = stampTbl; ctx.Gen = gen; ctx.Filter = filterBuf;
+            ctx.RLo = RLo; ctx.RHi = RHi; ctx.LHi = LHi; ctx.RLow = rLow;
+            ctx.Order = order; ctx.LoP = loP; ctx.HiP = hiP;
+            ctx.N = n; ctx.R0 = R0; ctx.R1 = R1; ctx.L0 = L0; ctx.L1 = L1;
 
-            var ldig = new int[ln];
-            Fp6m lprod = Fp6mOp.One(), linv = Fp6mOp.One();
-            for (int i = 0; i < ln; i++)
-            {
-                lprod = Fp6mOp.Mul6(lprod, Fp6mOp.Pow(gmP[L0 + i], loP[L0 + i]));
-                linv = Fp6mOp.Mul6(linv, Fp6mOp.Pow(gimP[L0 + i], loP[L0 + i]));
-            }
-
-            long tBuild = swBuild.ElapsedMilliseconds;
-            var swScan = System.Diagnostics.Stopwatch.StartNew();
-            // 真实约束是 Π g_k^{h_k} == pairing_val，但**正负号取决于 lift_x 取了哪个 y 根**
-            // （三组样本里 J6999 落在逆元、另两组直接相等）。两个目标放在同一趟里查 ——
-            // 失败后重跑整个 Solve 会白扫一遍 131072 次，那才是真正的时间大头。
-            Fp6m tgtI = Fp6m.FromFp6(Fp6.One / target);
-            int[] h = new int[n];
-            int hits = 0;
-            string hitNote = null;
-            int[] hitSol = null;
-
-            // 只读查找：命中就返回解，否则 null。无共享写入 ⇒ 可并行。
-            int[] Probe(in Fp6m needed, long s)
-            {
-                ProbeCalls++;
-                uint hh = HashM(needed);
-                long pp = LowerBound(keys, hh);
-                while (pp < keys.Length && (uint)(keys[pp] >> 32) == hh)
-                {
-                    ProbeHashHits++;
-                    long rs = (long)(uint)keys[pp];
-                    int[] rd;
-                    var swp = System.Diagnostics.Stopwatch.StartNew();
-                    Fp6m rv = ProdM(gmP, loP, hiP, R0, R1, rs, out rd);
-                    swp.Stop();
-                    ProbeProdMms += swp.Elapsed.TotalMilliseconds;
-                    if (rv.Eq(needed))
-                    {
-                        int[] ld;
-                        ProdM(gm, loP, hiP, L0, L1, s, out ld);
-                        var res = new int[n];
-                        for (int i = 0; i < n; i++) res[order[i]] = loP[i];
-                        for (int i = 0; i < ln; i++) res[order[L0 + i]] = loP[L0 + i] + ld[i];
-                        for (int i = 0; i < rn; i++) res[order[R0 + i]] = loP[R0 + i] + rd[i];
-                        return res;
-                    }
-                    pp++;
-                }
-                return null;
-            }
-
-            // 扫描同样按块并行（和建表一个套路）：每块用 ProdM(gim, ...) 算出自己的
-            // 起始逆乘积，块内跑里程计。解唯一，所以谁先命中都行。
-            // ★ 这里只维护 linv —— needed = tgt * linv，lprod 根本用不到，
-            //   原先每轮白做一次 Mul6。
             int[] stop = new int[1];
-            int nchunkL = Math.Max(1, nth);
-            long chunkL = (lsize + nchunkL - 1) / nchunkL;
-            System.Threading.Tasks.Parallel.For(0, nchunkL, ci =>
+            int[] hitSol = null;
+            string hitNote = null;
+            long chunkL = (lHigh + Math.Max(1, nth) - 1) / Math.Max(1, nth);
+
+            RunChunks(nth, lHigh, (begin, end) =>
             {
-                long begin = (long)ci * chunkL;
-                long end = Math.Min(begin + chunkL, lsize);
-                if (begin >= end) return;
-                int[] d0;
-                Fp6m li0 = ProdM(gimP, loP, hiP, L0, L1, begin, out d0);
-                var dg = (int[])d0.Clone();
-                // ★ 原来每步是 3 次 Mul6：算 tgt*li、算 tgtI*li、再推进 li。
-                //   但这两个探测值每步乘的都是同一个因子，各自增量维护即可 ——
-                //   探测变成零成本，每步只剩 2 次 Mul6（两个累加器各推进一次）。
-                Fp6m la = Fp6mOp.Mul6(tgt, li0);
-                Fp6m lb = Fp6mOp.Mul6(tgtI, li0);
-                for (long s = begin; s < end; s++)
+                int ci = chunkL > 0 ? (int)(begin / chunkL) : 0;      // 仅用于诊断信息
+                int[] tempSol = new int[n];
+                for (long j = begin; j < end; j++)
                 {
-                    if ((s & 0x3FF) == 0 && System.Threading.Volatile.Read(ref Abort) != 0) return;
+                    if ((System.Threading.Volatile.Read(ref Abort) != 0 || CancelFlag.IsSet(cancelBox))) return;
                     if (System.Threading.Volatile.Read(ref stop[0]) != 0) return;
-                    int[] r = Probe(la, s);
-                    if (r == null) r = Probe(lb, s);
-                    if (r != null)
+                    Fp6mOp.Dot6 d = LHiDot[j];
+                    for (long i = 0; i < lLow; i++)
                     {
-                        if (System.Threading.Interlocked.CompareExchange(ref stop[0], 1, 0) == 0)
+                        long s = i + lLow * j;
+                        bool matched = false;
+                        if (Probe(ctx, HashX(Fp6mOp.DotCoord(LLoA[i], d)), LLoA[i], j, s, tempSol)) matched = true;
+                        else if (Probe(ctx, HashX(Fp6mOp.DotCoord(LLoB[i], d)), LLoB[i], j, s, tempSol)) matched = true;
+                        if (matched)
                         {
-                            hitSol = r;
-                            hits++;
-                            hitNote = "左半 #" + s + " 命中右半（并行块 " + ci + "）";
+                            // 只有一个工作线程可以写 hitSol / hitNote
+                            if (System.Threading.Interlocked.CompareExchange(ref stop[0], 1, 0) == 0)
+                            {
+                                hitSol = tempSol;
+                                hitNote = "左半 #" + s + " 命中右半（并行块 " + ci + "）";
+                            }
+                            return;
                         }
-                        return;
-                    }
-                    for (int _j = 0; _j < actL.Length; _j++)
-                    {
-                        int i = actL[_j];
-                        if (dg[i] < hiP[L0 + i] - loP[L0 + i])
-                        { dg[i]++; la = Fp6mOp.Mul6(la, gimP[L0 + i]); lb = Fp6mOp.Mul6(lb, gimP[L0 + i]); break; }
-                        dg[i] = 0;
-                        la = Fp6mOp.Mul6(la, lwrapi[i]);
-                        lb = Fp6mOp.Mul6(lb, lwrapi[i]);
                     }
                 }
             });
+
             if (hitSol != null)
             {
                 note = hitNote;
                 return hitSol;
             }
-            note = "未找到（命中 " + hits + " 次）";
+            note = "未找到";
             return null;
-        }
-
-        static long LowerBound(ulong[] a, uint hh)
-        {
-            ulong key = (ulong)hh << 32;
-            int lo = 0, hi = a.Length;
-            while (lo < hi) { int m = (lo + hi) >> 1; if (a[m] < key) lo = m + 1; else hi = m; }
-            return lo;
         }
     }
 
@@ -1479,7 +2211,7 @@ namespace PidKeyPlugIn
                 return v.IsZero ? BigInteger.One : v;
             }
             const int N = 200;
-            int ok1 = 0, ok2 = 0, ok3 = 0, ok4 = 0;
+            int ok1 = 0, ok2 = 0, ok3 = 0, ok4 = 0, ok6 = 0, ok7 = 0, ok8 = 0, ok9 = 0;
             BigInteger x0 = R(), y0 = R();
 
             for (int i = 0; i < N; i++)
@@ -1505,6 +2237,24 @@ namespace PidKeyPlugIn
                 if (Fpm.ToBig(g6.R.C0) == w6.C0.C0 && Fpm.ToBig(g6.R.C1) == w6.C0.C1
                  && Fpm.ToBig(g6.R.C2) == w6.C0.C2 && Fpm.ToBig(g6.I.C0) == w6.C1.C0
                  && Fpm.ToBig(g6.I.C1) == w6.C1.C1 && Fpm.ToBig(g6.I.C2) == w6.C1.C2) ok4++;
+
+                // 6) K3 专用平方 == Mul3(a, a)
+                Fp3m m3 = Fp3m.FromFp3(a3);
+                Fp3m sq3 = Fp6mOp.Sqr3(m3), mm3 = Fp6mOp.Mul3(m3, m3);
+                if (sq3.Eq(mm3)) ok6++;
+
+                // 7) K6 专用平方 == Mul6(a, a)
+                Fp6m m6 = Fp6m.FromFp6(a6);
+                if (Fp6mOp.Sqr6(m6).Eq(Fp6mOp.Mul6(m6, m6))) ok7++;
+
+                // 8) 点积形式的第一个坐标 == Mul6(x, y).R.C0
+                Fp6m y6 = Fp6m.FromFp6(b6);
+                if (Fp6mOp.DotCoord(m6, Fp6mOp.DotForm(y6)).Eq(Fp6mOp.Mul6(m6, y6).R.C0)) ok8++;
+
+                // 9) Montgomery 域开平方 == BigInteger 版（平方数与随机数各一半）
+                BigInteger sqIn = (i & 1) == 0 ? x * x % Gf.P : x;
+                BigInteger? sOld = Fp.Sqrt(sqIn), sNew = FpmSqrt.Sqrt(sqIn);
+                if (sOld.HasValue == sNew.HasValue && (!sOld.HasValue || sOld.Value == sNew.Value)) ok9++;
             }
             if (bench)
             {
@@ -1530,10 +2280,17 @@ namespace PidKeyPlugIn
             try { Gf.P = Gf.P; ok5++; } catch { }
             try { Gf.P = Gf.P + 1; } catch (BaseFieldMismatchException) { ok5++; }
 
-            bool all = ok1 == N && ok2 == N && ok3 == N && ok4 == N && ok5 == 2;
+            // 10) 1/(-2) 的闭式 (p-1)/2 == 扩展欧几里得的结果
+            bool invNeg2 = ((Gf.P - 1) >> 1) == Gf.Inv(-2);
+
+            bool all = ok1 == N && ok2 == N && ok3 == N && ok4 == N && ok5 == 2
+                    && ok6 == N && ok7 == N && ok8 == N && ok9 == N && invNeg2;
             log("[自检] Fpm.Mul " + ok1 + "/" + N + "   Gf.Inv " + ok2 + "/" + N
                 + "   K3 " + ok3 + "/" + N + "   K6 " + ok4 + "/" + N
                 + "   基域守卫 " + ok5 + "/2"
+                + "   Sqr3 " + ok6 + "/" + N + "   Sqr6 " + ok7 + "/" + N
+                + "   Dot " + ok8 + "/" + N + "   Sqrt " + ok9 + "/" + N
+                + "   1/(-2) " + (invNeg2 ? "ok" : "BAD")
                 + "   -> " + (all ? "PASS" : "*** FAIL ***"));
             return all;
         }
