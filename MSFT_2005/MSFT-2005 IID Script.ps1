@@ -46,31 +46,52 @@ PublicKeyValue --> ECC Information, --> match against Raw Key Info
 
 -- Most Updated Struct Info --
 
+// ============================================================================
+//  MSFT_PKEY_DATA” 0x58 bytes. Shared by 2005 and 2009.
+//  Begins at PID_OBJ+0x20; decoder writes it in place via &obj->Data.
+// ============================================================================
+
+typedef struct _MSFT_PKEY_DATA {       // 0x58
+    uint64_t Reserved;                 // 0x00  = 0
+    GUID     Algorithm;                // 0x08  2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
+                                       //       2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+                                       //   constant per algorithm (GetClsidAlgorithm);
+                                       //   NOT key-specific, NOT the ProductId ActConfigId GUID
+    uint32_t GroupID;                  // 0x18
+    uint32_t serialLow;                // 0x1C  channel  = fullSerial / 1_000_000
+    uint32_t SerialHigh;               // 0x20  sequence = fullSerial % 1_000_000
+    uint32_t LicenseFlags;             // 0x24  bit0 = upgrade
+    uint64_t Security;                 // 0x28
+    uint32_t HaveRawKey;               // 0x30  1 once RawKeyMaterial@0x38 is populated (set early, both algos)
+    uint32_t Solved;                   // 0x34  0 until validation succeeds; 1 on success
+                                       //       (2005: 0 through pipeline â†’ 1 after MITM; 2009: 1 at parse;
+                                       //        stays 0 on an invalid key)
+    uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
+    union {                            // 0x48  16-byte slot; base64'd by sub_180015728
+        uint8_t Decoded_M[6];          //   2005: 6 real M bytes;  base64 emits 12 (6 + zero-pad)
+        uint8_t ActData[13];           //   2009: 13 packed bytes; base64 emits 13
+        uint8_t Payload[16];           //   full slot; unused tail = 0
+    };
+} MSFT_PKEY_DATA;                      // ends 0x58
+
+// ============================================================================
+//  PID_OBJ” 0x98 bytes. Embeds MSFT_PKEY_DATA at +0x20.
+// ============================================================================
+
 typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
-    uint64_t  RefCount;                // 0x00  = 1 at build; atomic, freed at 0
-    wchar_t*  ProductIdStr;            // 0x08  "msft2005:{GUID}&{base64}"  (set by sub_180015728)
-    FILETIME  ValidationTime;          // 0x10
-    uint32_t  DataIdSequence;          // 0x18  full serial (int32)
-    uint32_t  _pad1c;                  // 0x1C
-    // ---- embedded key object (memset 0, then filled by populate) ----
-    //      the validator (sub_18008D85C) sees this sub-struct as keyObj, base = +0x20
-    uint32_t  GroupID;                 // 0x38  (keyObj+0x18)
-    uint32_t  SerialA;                 // 0x3C  channel   (keyObj+0x1C)
-    uint32_t  SerialB;                 // 0x40  sequence  (keyObj+0x20)
-    uint32_t  LicenseFlags;            // 0x44  bit0 = upgrade
-    uint64_t  Security;                // 0x48  (keyObj+0x28)
-    uint32_t  HaveRawKey;              // 0x50  = 1  (keyObj+0x30)
-    uint32_t  Solved;                  // 0x54  = 1 on success (keyObj+0x34)
-    uint8_t   RawKeyMaterial[16];      // 0x58  (keyObj+0x38)
-    uint8_t   Decoded_M[6];            // 0x68  (keyObj+0x48)  <- ExtractMBytes via TryCandidate r9
-    uint8_t   _padM[2];                // 0x6E
-    // ---- reserved tail: zero-initialized, never written in validate path ----
-    uint64_t  _reserved70;             // 0x70  == 0
-    uint64_t  _reserved78;             // 0x78  == 0  (and qword,0)
-    uint64_t  _reserved80;             // 0x80  == 0  (and qword,0)
-    uint64_t  _reserved88;             // 0x88  == 0  (and qword,0)
-    uint64_t  _reserved90;             // 0x90  == 0
-} PID_OBJ; 
+    uint64_t       RefCount;           // 0x00  = 1 at build; atomic, freed at 0
+    wchar_t*       ProductIdStr;       // 0x08  "msft2005:{ActConfigId}&{base64}" (sub_180015728)
+    FILETIME       ValidationTime;     // 0x10
+    uint32_t       Serial;             // 0x18  full un-split serial
+    uint32_t       _pad1C;             // 0x1C  alignment to 0x20
+
+    MSFT_PKEY_DATA Data;               // 0x20 .. 0x78
+
+    void*    pGroupConfig;             // 0x78 -> group record {flag, ActConfigId GUID (a0cde89c…), GroupID 172, sub-ptrs}
+    void*    pEditionTable;            // 0x80 -> interned pkeyconfig XML (<pkc:PartNumber>X15-…, IsValid, edition GUIDs)
+    void*    pGroupIndex;              // 0x88 -> key/edition descriptor {GroupID 172, KeySize=1579 (BINK blob), edition IDs}
+    uint64_t Field90;                  // 0x90 -> data qword (NOT a pointer; seed/cookie/hash” still to characterize)
+} PID_OBJ;                             // 0x98
 #>
 
 function Format-HexView {

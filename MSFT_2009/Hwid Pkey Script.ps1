@@ -7,6 +7,55 @@ using namespace System.IO.Compression
 using namespace System.Management.Automation
 using namespace System.Runtime.InteropServices
 
+<#
+// ============================================================================
+//  MSFT_PKEY_DATA” 0x58 bytes. Shared by 2005 and 2009.
+//  Begins at PID_OBJ+0x20; decoder writes it in place via &obj->Data.
+// ============================================================================
+
+typedef struct _MSFT_PKEY_DATA {       // 0x58
+    uint64_t Reserved;                 // 0x00  = 0
+    GUID     Algorithm;                // 0x08  2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
+                                       //       2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+                                       //   constant per algorithm (GetClsidAlgorithm);
+                                       //   NOT key-specific, NOT the ProductId ActConfigId GUID
+    uint32_t GroupID;                  // 0x18
+    uint32_t serialLow;                // 0x1C  channel  = fullSerial / 1_000_000
+    uint32_t SerialHigh;               // 0x20  sequence = fullSerial % 1_000_000
+    uint32_t LicenseFlags;             // 0x24  bit0 = upgrade
+    uint64_t Security;                 // 0x28
+    uint32_t HaveRawKey;               // 0x30  1 once RawKeyMaterial@0x38 is populated (set early, both algos)
+    uint32_t Solved;                   // 0x34  0 until validation succeeds; 1 on success
+                                       //       (2005: 0 through pipeline â†’ 1 after MITM; 2009: 1 at parse;
+                                       //        stays 0 on an invalid key)
+    uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
+    union {                            // 0x48  16-byte slot; base64'd by sub_180015728
+        uint8_t Decoded_M[6];          //   2005: 6 real M bytes;  base64 emits 12 (6 + zero-pad)
+        uint8_t ActData[13];           //   2009: 13 packed bytes; base64 emits 13
+        uint8_t Payload[16];           //   full slot; unused tail = 0
+    };
+} MSFT_PKEY_DATA;                      // ends 0x58
+
+// ============================================================================
+//  PID_OBJ” 0x98 bytes. Embeds MSFT_PKEY_DATA at +0x20.
+// ============================================================================
+
+typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
+    uint64_t       RefCount;           // 0x00  = 1 at build; atomic, freed at 0
+    wchar_t*       ProductIdStr;       // 0x08  "msft2005:{ActConfigId}&{base64}" (sub_180015728)
+    FILETIME       ValidationTime;     // 0x10
+    uint32_t       Serial;             // 0x18  full un-split serial
+    uint32_t       _pad1C;             // 0x1C  alignment to 0x20
+
+    MSFT_PKEY_DATA Data;               // 0x20 .. 0x78
+
+    void*    pGroupConfig;             // 0x78 -> pkeyconfig group records {flag, ActConfigId GUID, GroupID, sub-ptrs}
+    void*    pEditionTable;            // 0x80 -> edition records {ActConfigId, EditionId GUID, GroupID, KeyRange=9999999}
+    void*    pGroupIndex;              // 0x88 -> master index of all GroupIDs
+    uint64_t Field90;                  // 0x90 -> data qword (NOT a pointer; seed/cookie/hash” still to characterize)
+} PID_OBJ;                             // 0x98
+#>
+
 #region HWID
 # API: LicensingWinRT.dll
 # __int64 __fastcall GetDownlevelPkeyData(unsigned __int8 *a1, __int64 a2, __int64 a3, __int64 a4)
@@ -2107,42 +2156,6 @@ function Invoke-IIDRequest {
         [String]$ConfigPath,
         [Nullable[Guid]]$SkuID
     )
-
-    <#
-    // Size: 0x58 (88 bytes) // v12
-    typedef struct _MSFT_PKEY_DATA {
-        uint64_t Reserved;          // 0x00
-        uint8_t  Signature[16];     // 0x08
-        uint32_t GroupID;           // 0x18
-        uint32_t ChannelID;         // 0x1C
-        uint32_t Serial;            // 0x20
-        uint32_t Sequence;          // 0x24
-        uint64_t SecurityID;        // 0x28
-        uint32_t LicenseAttributes; // 0x30
-        uint32_t KeyType;           // 0x34
-        uint64_t IssuanceTimestamp; // 0x38
-        uint32_t ActivationFlags;   // 0x40
-        uint32_t ReservedPadding;   // 0x44
-        uint8_t  HardwareID[16];    // 0x48
-    } MSFT_PKEY_DATA;
-
-    // Size: 0x98 (152 bytes) // lpMem
-    typedef struct _PID_OBJ {
-        uint64_t       RefCount;          // 0x00
-        wchar_t*       ProductIdStr;      // 0x08
-        FILETIME       ValidationTime;    // 0x10
-        uint32_t       DataIdSequence;    // 0x18
-        uint32_t       AlignmentPadding;  // 0x1C
-
-        // v12, Function Take V12+8
-        MSFT_PKEY_DATA Data;              // 0x20 - 0x78
-
-        void*          pPKeyConfig;       // 0x78
-        void*          pKeyBits;          // 0x80
-        void*          pMetadata;         // 0x88
-        uint8_t        RandomSeed[8];     // 0x90
-    } PID_OBJ;
-    #>
 
     try {
         $Module = [AppDomain]::CurrentDomain.GetAssemblies() | ? { $_.ManifestModule.ScopeName -eq "OFF" } | select -Last 1
