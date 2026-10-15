@@ -11,7 +11,11 @@ param(
     [switch]$FromParent,
 
     [ValidateSet('PidGenX','PkeyLib')]
-    [string]$RunAs = 'PidGenX'
+    [string]$RunAs = 'PidGenX',
+
+    # File / Xml / Binks = native PkeyLib export, BinksNet = managed C# engine (PidKeyPlugIn), same index, all cores
+    [ValidateSet('File','Xml','Binks','BinksNet')]
+    [string]$Method = 'Binks'
 )
 
 # List of Source, not by order
@@ -50,7 +54,7 @@ $IsArm   = ($env:PROCESSOR_ARCHITECTURE -eq 'Arm')
 $IsArm64 = ($env:PROCESSOR_ARCHITECTURE -eq 'Arm64')
 
 if ($IsArm) {
-	throw "32-bit ARM is not supported"
+    throw "32-bit ARM is not supported"
 }
 
 #region Shared
@@ -1637,6 +1641,23 @@ function Get-PkeyBinkLists {
         BinkSize  = $binkSize
     }
 }
+function ConvertTo-PkeyBinkArrays {
+    param([Parameter(Mandatory)]$Lists)   # output of Get-PkeyBinkLists
+    $n = [int]$Lists.Count; $size = [int]$Lists.BinkSize
+    $ids  = New-Object 'int[]' $n
+    $keys = New-Object 'byte[][]' $n
+    for ($i = 0; $i -lt $n; $i++) {
+        $ids[$i] = [BitConverter]::ToInt32($Lists.GroupList, 8 + 4 * $i)      # 8 = list header
+        $k = New-Object 'byte[]' $size
+        [Buffer]::BlockCopy($Lists.BinkList, 8 + $i * $size, $k, 0, $size)
+        $keys[$i] = $k
+    }
+    [pscustomobject]@{ Ids = $ids; Keys = $keys }
+}
+function Get-PkeyBinkArrays {
+    param([Parameter(Mandatory)][string]$ConfigPath)   # .xrm-ms, .xml, pkeyindex.json(.gz) or binks.csv
+    ConvertTo-PkeyBinkArrays (Get-PkeyBinkLists -ConfigPath $ConfigPath)
+}
 #endregion
 #region Lammos DLL
 <#
@@ -1890,6 +1911,187 @@ public static class PKeyInnerInterop {
 }
 "@ -ErrorAction Stop
 }
+if (!([PSTypeName]'PidKeyPlugIn.PubKeyParser').Type) {
+  $b = [Convert]::FromBase64String(((@'
+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
+==
+'@) -replace '\s',''))
+  $s = (New-Object IO.StreamReader((New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(,$b)),[IO.Compression.CompressionMode]::Decompress)),[Text.Encoding]::UTF8)).ReadToEnd()
+  $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+  Add-Type -AssemblyName System.Numerics; [void]$cp.ReferencedAssemblies.AddRange([string[]]@([uri].Assembly.Location, [System.Linq.Enumerable].Assembly.Location, [System.Numerics.BigInteger].Assembly.Location))
+  $cp.CompilerOptions = '/optimize+'
+  $a = @{ IgnoreWarnings = $true }
+  if ($PSVersionTable.PSEdition -ne 'Core') { $a = @{ CompilerParameters = $cp } }
+  Add-Type -TypeDefinition $s @a
+}
 function Invoke-PkeyInner {
     [CmdletBinding()]
     param(
@@ -1958,12 +2160,13 @@ if(-not $Global:iid) {
 #   'File'  = VerifyKey        (key text + config path, always scans every group)   needs -Config
 #   'Xml'   = VerifyBinaryKey  (raw key + config bytes)                             needs -Config
 #   'Binks' = VerifyBinks      (raw key + group list + bink list)                   uses the index in $ConfigPath
-$Method = 'Binks'
+#   'BinksNet' =               Managed C# TryBinks (PidKeyPlugIn, Parallel.For over all groups)   uses the same index, no DLL needed
+# (choose with -Method; default 'Binks')
 
 # Group to test, 0 = every group ('Xml' and 'Binks')
 $TargetGroup = 0
 
-if ($Method -eq 'Binks') {
+if ($Method -in 'Binks','BinksNet') {
     if (-not [System.Io.File]::Exists((Join-Path $ConfigPath "pkeyindex.json"))) {
       New-PkeyIndex -Path $ConfigPath -Format JSON | Out-Null
     }
@@ -1973,9 +2176,9 @@ if ($Method -eq 'Binks') {
 # --- Execution Flow ---
 # ------------------------------------------------------------
 
-if ('File', 'Xml', 'Binks' -notcontains $Method) { throw "Unknown `$Method '$Method' (use File, Xml or Binks)" }
+if ('File', 'Xml', 'Binks', 'BinksNet' -notcontains $Method) { throw "Unknown `$Method '$Method' (use File, Xml, Binks or BinksNet)" }
 if (-not $CDKey) { throw 'Provide -CDKey (25 characters).' }
-if ($Method -ne 'Binks') {
+if ($Method -notin 'Binks','BinksNet') {
     if (-not $Config) { throw "Provide -Config (path to pkeyconfig.xrm-ms) for the '$Method' method." }
     if (-not [IO.Path]::IsPathRooted($Config)) { $Config = [IO.Path]::Combine($PWD.Path, $Config) }
     if (-not [IO.File]::Exists($Config)) { throw "Config not found: $Config" }
@@ -1989,13 +2192,17 @@ if ($Method -eq 'Xml') {
   $xml = [System.IO.File]::ReadAllBytes($Config)
 }
 
-if ($Method -eq 'Binks') {
+if ($Method -in 'Binks','BinksNet') {
     if (-not $Global:ConfigDB) { 
       $Global:ConfigDB = Import-PkeyIndex -Path "$ConfigPath\pkeyindex.json" 
     }
-    if (-not $Global:BinkDB) {
-      $Global:BinkDB = Get-PkeyBinkLists -Index $Global:ConfigDB 
-    }
+}
+if ($Method -eq 'Binks' -and -not $Global:BinkDB) {
+    $Global:BinkDB = Get-PkeyBinkLists -Index $Global:ConfigDB 
+}
+
+if ($Method -eq 'BinksNet' -and -not [PidKeyPlugIn.PKeyCalc].GetMethod('TryBinks')) {
+    throw 'Older PidKeyPlugIn is loaded in this session. Open a new PowerShell window and run again.'
 }
 
 # VerifyBinks return codes (1 = valid, 0 = no match)
@@ -2040,6 +2247,7 @@ try {
             )
         }
         'Binks' {
+            
             # VerifyBinks Call
             $code = $PkeyLib::VerifyBinks(
                 $rawKey, $rawKey.Length,
@@ -2050,13 +2258,45 @@ try {
             )
             $success = ($code -eq 1)
         }
+
+        'BinksNet' {
+
+            # Managed engine (PidKeyPlugIn.PKeyCalc, ported C#). ONE call, all groups, all cores:
+            # Parallel.For inside TryBinks, lowest group index wins (same result as the DLL's scan).
+            # The byte[][] / int[] arrays are built once per session and cached in $Global:NetBinks.
+            if (-not $Global:NetBinks) {
+                $groups = $Global:ConfigDB['groups']
+                $ids = New-Object System.Collections.Generic.List[int]
+                $pks = New-Object System.Collections.Generic.List[byte[]]
+                foreach ($gidStr in @($groups.Keys | Sort-Object { [int]$_ })) {
+                    $node = $groups[$gidStr]
+                    if (-not $node.ContainsKey('bink')) { continue }
+                    $ids.Add([int]$gidStr)
+                    $pks.Add([Convert]::FromBase64String($node['bink']))     # PublicKeyPart1 + Part2
+                }
+                $Global:NetBinks = [pscustomobject]@{ Ids = $ids.ToArray(); Keys = $pks.ToArray() }
+            }
+            $ids = $Global:NetBinks.Ids; $pks = $Global:NetBinks.Keys
+            if ($TargetGroup -ne 0) {
+                $at = [Array]::IndexOf($ids, [int]$TargetGroup)
+                if ($at -lt 0) { $ids = [int[]]@(); $pks = [byte[][]]@() }
+                else           { $ids = [int[]]@($ids[$at]); $pks = [byte[][]]@(,$pks[$at]) }
+            }
+            $g = 0; $h1 = $null; $u = $null
+            $code = [PidKeyPlugIn.PKeyCalc]::TryBinks($pks, $ids, $rawKey, $Threads, [ref]$g, [ref]$h1, [ref]$u)
+            if ($code -eq 1) {
+                $uidBytes = [byte[]]$u[0..7]
+                $group    = $g
+                $success  = $true
+            }
+        }
     }
 } finally {
     $Dtimer.Stop()
 }
 
 if ($success) {
-    if ($Method -eq 'Binks') {
+    if ($Method -in 'Binks','BinksNet') {
         # The index knows which pkeyconfig holds this group + serial; 'File' and 'Xml' already have -Config
         $serial = (([BitConverter]::ToUInt64($uidBytes, 0)) -shr 1) -band 0x3FFFFFFF
         $Config = Find-PkeyFile $Global:ConfigDB $group $serial | Select-Object -First 1 -ExpandProperty Path

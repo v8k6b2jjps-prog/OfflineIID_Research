@@ -80,8 +80,7 @@ private:
             int radix = hi[from + i] - lo[from + i] + 1;
             int d = (int)(t % radix); t /= radix;
             digsOut[i] = d;
-            BigInteger expVal(lo[from + i] + d);
-            v = Fp6mOp::Mul6(v, Fp6mOp::PowBig(g[from + i], expVal));
+            v = Fp6mOp::Mul6(v, Fp6mOp::PowSmall(g[from + i], (uint32_t)(lo[from + i] + d)));
         }
         return v;
     }
@@ -198,8 +197,8 @@ private:
         for (int i = 0; i < cnt; i++) {
             span[i] = hi[from + i] - lo[from + i];
             dg[i] = 0;
-            prod = Fp6mOp::Mul6(prod, Fp6mOp::PowBig(gen[from + i], BigInteger(lo[from + i])));
-            wrap[i] = Fp6mOp::PowBig(genInv[from + i], BigInteger(span[i]));
+            prod = Fp6mOp::Mul6(prod, Fp6mOp::PowSmall(gen[from + i], (uint32_t)lo[from + i]));
+            wrap[i] = Fp6mOp::PowSmall(genInv[from + i], (uint32_t)span[i]);
         }
         for (int64_t s = 0;;) {
             out[(size_t)s] = prod;

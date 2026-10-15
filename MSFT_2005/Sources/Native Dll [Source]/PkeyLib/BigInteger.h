@@ -123,6 +123,10 @@ public:
     bool IsEven() const { return mpz_even_p(val) != 0; }
     int Sign() const { return mpz_sgn(val); }
 
+    // Allocation-free single-bit read. Replaces the (x >> i) & 1 idiom in the
+    // hot exponent/ladder walks, which constructs two temporary mpz_t per bit.
+    bool TestBit(int i) const { return mpz_tstbit(val, (mp_bitcnt_t)i) != 0; }
+
     static BigInteger Zero() { return BigInteger(0); }
     static BigInteger One() { return BigInteger(1); }
 
@@ -270,6 +274,14 @@ public:
         if (x.Sign() >= 0 && x < currentP) return x;
         BigInteger r = x % currentP;
         return (r.Sign() < 0) ? (r + currentP) : r;
+    }
+
+    // 1/(-2) mod p in closed form. p is odd, so -2 * (p-1)/2 = -(p-1) = 1 (mod p),
+    // i.e. the inverse of -2 is exactly (p-1)/2. No extended-GCD loop at all.
+    static BigInteger InvNeg2() {
+        BigInteger half = GetP() - BigInteger(1);
+        half >>= 1;
+        return half;
     }
 
     static BigInteger Inv(const BigInteger& a) {

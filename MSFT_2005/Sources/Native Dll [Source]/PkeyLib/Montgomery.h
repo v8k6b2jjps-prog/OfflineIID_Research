@@ -409,6 +409,130 @@ public:
     }
 };
 
+// -------------------------------------------------------------------------
+// Square root in Fp and the curve lift, entirely in the Montgomery domain.
+//
+// Replaces Fp::Sqrt / Curve::LiftX for the hot call site (one lift per key
+// attempt). Same algorithm (Tonelli-Shanks) and same answer (the smaller of
+// the two roots), but every modular multiply is a two-limb Fpm::Mul instead of
+// an mpz multiply plus a division, and the exponents q and (q+1)/2 and the
+// constant z^q depend only on p, so they are computed ONCE (Gf::SetP pins a
+// single prime per process). The old BigInteger path is left in place as the
+// reference implementation.
+//
+// The Euler-criterion pre-check of the old code is dropped: for a non-residue
+// a, t = a^q has order exactly 2^s, so the loop below reaches i >= m and
+// reports "no root" -- the same answer one full exponentiation cheaper.
+// -------------------------------------------------------------------------
+struct FpmSqrtCtx {
+    int s = 0;
+    std::vector<uint8_t> qBits;    // q = (p-1) / 2^s
+    std::vector<uint8_t> q1Bits;   // (q+1) / 2
+    Fpx c{};                       // z^q, Montgomery form
+};
+
+class FpmSqrt {
+    using Ctx = FpmSqrtCtx;
+    inline static Ctx _ctx;
+    inline static std::once_flag _flag;
+
+    static void BitsOf(BigInteger e, std::vector<uint8_t>& bits) {
+        bits.clear();
+        while (e.Sign() > 0) { bits.push_back(e.TestBit(0) ? (uint8_t)1 : (uint8_t)0); e >>= 1; }
+    }
+
+    static Fpx Pow(const Fpx& a, const std::vector<uint8_t>& bits) {
+        Fpx r = Fpm::One, b = a;
+        const size_t n = bits.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (bits[i]) r = Fpm::Mul(r, b);
+            b = Fpm::Mul(b, b);
+        }
+        return r;
+    }
+
+    static void Init() {
+        std::call_once(_flag, []() {
+            Fpm::Init();
+            BigInteger p = Gf::GetP();
+            BigInteger pm1 = p - BigInteger(1);
+            BigInteger q = pm1;
+            int s = 0;
+            while (q.IsEven()) { q >>= 1; s++; }
+            _ctx.s = s;
+            BitsOf(q, _ctx.qBits);
+            BitsOf((q + BigInteger(1)) >> 1, _ctx.q1Bits);
+
+            // Smallest quadratic non-residue z >= 2 (same search order as the
+            // old Fp::NonResidue, so the same z and therefore the same c).
+            BigInteger half = pm1 >> 1;
+            BigInteger z = 2;
+            while (BigInteger::ModPow(z, half, p).IsOne()) z = z + BigInteger(1);
+            _ctx.c = Pow(Fpm::FromBig(z), _ctx.qBits);
+        });
+    }
+
+    static bool IsZeroM(const Fpx& a) { return a.A0 == 0 && a.A1 == 0; }
+
+public:
+    // Root of a Montgomery-form element. false if a is a non-residue.
+    // Returns the canonical smaller root (min(x, p-x)) as an integer.
+    static bool SqrtM(const Fpx& am, BigInteger& out) {
+        Init();
+        if (IsZeroM(am)) { out = BigInteger::Zero(); return true; }
+
+        Fpx x = Pow(am, _ctx.q1Bits);
+        Fpx t = Pow(am, _ctx.qBits);
+        Fpx c = _ctx.c;
+        int m = _ctx.s;
+        const Fpx one = Fpm::One;
+
+        while (!t.Eq(one)) {
+            int i = 0;
+            Fpx tt = t;
+            while (!tt.Eq(one)) {
+                tt = Fpm::Mul(tt, tt);
+                i++;
+                if (i >= m) return false;
+            }
+            Fpx b = c;
+            for (int k = 0; k < m - i - 1; k++) b = Fpm::Mul(b, b);
+            x = Fpm::Mul(x, b);
+            Fpx b2 = Fpm::Mul(b, b);
+            t = Fpm::Mul(t, b2);
+            c = b2;
+            m = i;
+        }
+
+        BigInteger xv = Fpm::ToBig(x);
+        BigInteger hi = Gf::GetP() - xv;
+        out = (xv <= hi) ? xv : hi;
+        return true;
+    }
+
+    static std::optional<BigInteger> Sqrt(const BigInteger& a_in) {
+        Init();
+        BigInteger r;
+        if (!SqrtM(Fpm::FromBig(a_in), r)) return std::nullopt;
+        return r;
+    }
+
+    // Drop-in for Curve::LiftX: returns {y, -y} with y the smaller root of
+    // x^3 + a*x + b, or nullopt when x is not an abscissa on the curve.
+    static std::optional<std::vector<BigInteger>> LiftX(const BigInteger& x_in, const BigInteger& a, const BigInteger& b) {
+        Init();
+        Fpx xm = Fpm::FromBig(x_in);
+        Fpx am = Fpm::FromBig(a);
+        Fpx bm = Fpm::FromBig(b);
+        // x*(x*x + a) + b  ==  x^3 + a*x + b
+        Fpx rhs = Fpm::Add(Fpm::Mul(xm, Fpm::Add(Fpm::Mul(xm, xm), am)), bm);
+        BigInteger yv;
+        if (!SqrtM(rhs, yv)) return std::nullopt;
+        BigInteger negYv = Gf::Mod(-yv);
+        return std::vector<BigInteger>{ yv, negYv };
+    }
+};
+
 struct Fp3m {
     Fpx C0, C1, C2;
     static Fp3m FromFp3(const Fp3& a) {
@@ -753,6 +877,52 @@ public:
         return r;
     }
 
+    // ===================================================================
+    // Allocation-free constant-exponent powering.
+    //
+    // PowBig walks the exponent with (e & 1) + (e >>= 1), constructing two
+    // temporary mpz_t PER BIT. For the final exponentiation (~220-bit hard
+    // part) and the Fp3 inverse (~330-bit p^3-2), both run per point per
+    // candidate, that is thousands of heap alloc/free pairs per candidate for
+    // nothing: the exponent never changes within a call.
+    //
+    // ExpandBits walks the exponent ONCE into a native bit array using an
+    // in-place shift (operator>>= is in-place, no alloc) and mpz_tstbit
+    // (no alloc). PowBigBits then does the same square-and-multiply with ZERO
+    // allocation. Same squares, same multiplies, same LSB-first order as
+    // PowBig -> bit-for-bit identical result. Mirrors Fpm::_exp2Bits/InvFast.
+    // ===================================================================
+    static void ExpandBits(const BigInteger& e_in, std::vector<uint8_t>& bits) {
+        bits.clear();
+        BigInteger e = e_in;                 // single copy; the rest is in-place
+        while (e.Sign() > 0) {
+            bits.push_back(e.TestBit(0) ? (uint8_t)1 : (uint8_t)0);
+            e >>= 1;
+        }
+    }
+
+    static Fp6m PowBigBits(const Fp6m& a, const std::vector<uint8_t>& bits) {
+        Fp6m r = One(), b = a;
+        for (size_t i = 0; i < bits.size(); ++i) {
+            if (bits[i]) r = Mul6(r, b);
+            b = Sqr6(b);
+        }
+        return r;
+    }
+
+    // a^e for a small non-negative native exponent: identical result to PowBig
+    // (same multiply order; only the never-used last squaring is skipped) with
+    // no BigInteger at all.
+    static Fp6m PowSmall(const Fp6m& a, uint32_t e) {
+        Fp6m r = One(), b = a;
+        while (e) {
+            if (e & 1u) r = Mul6(r, b);
+            e >>= 1;
+            if (e) b = Sqr6(b);
+        }
+        return r;
+    }
+
     static Fp6m PowBig(const Fp6m& a, const BigInteger& e_in) {
         BigInteger e = e_in;
         Fp6m r = One(), b = a;
@@ -811,10 +981,22 @@ public:
     // Fp3 inverse by Fermat (a^(p^3-2)). ONE Fp3 inverse per final exp -- far
     // cheaper than a full Fp6 inverse. (Upgradeable to Itoh-Tsujii: reduce to a
     // single Fp inverse + Frobenius; left simple here.)
+    //
+    // The exponent p^3-2 depends ONLY on the base field, and Gf::SetP pins a
+    // single p for the whole process (it throws on a second, different prime),
+    // so the bit expansion is cached once. Same algorithm / multiply count as
+    // before; only the per-bit mpz_t churn is gone.
+    inline static std::vector<uint8_t> _inv3Bits;
+    inline static std::once_flag _inv3Flag;
     static Fp3m Inv3(const Fp3m& a){
-        BigInteger e = Gf::GetP(); e = e*e*e - BigInteger(2);
+        std::call_once(_inv3Flag, []{
+            BigInteger e = Gf::GetP(); e = e*e*e - BigInteger(2);
+            _inv3Bits.clear();
+            while (e.Sign() > 0) { _inv3Bits.push_back(e.TestBit(0) ? (uint8_t)1 : (uint8_t)0); e >>= 1; }
+        });
         Fp3m r=One3(), b=a;
-        while(!e.IsZero() && e>0){ if(!(e&1).IsZero()) r=Mul3(r,b); b=Sqr3(b); e>>=1; }
+        const size_t n=_inv3Bits.size();
+        for (size_t i=0;i<n;++i){ if(_inv3Bits[i]) r=Mul3(r,b); b=Sqr3(b); }
         return r;
     }
     // Easy part of the final exponentiation, f^(p^3-1), WITHOUT a full Fp6
@@ -829,10 +1011,20 @@ public:
     }
     // Frobenius-factored final exponentiation: f^((p^6-1)/n)
     //   = ( f^(p^3-1) ) ^ ( (p^3+1)/n ).
-    // Caller passes hardExp = (p^3+1)/n (n = curve order). Replaces a ~550-bit
-    // PowBig over the full E with an inverse-free easy part + a ~220-bit PowBig.
+    // hardExp = (p^3+1)/n (n = curve order).
+    //
+    // The hard exponent depends on the curve ORDER n, which can differ between
+    // binks in one scan even when they share the base field p. So it is NOT
+    // cached across calls. FinalExpBits takes an already-expanded bit array so
+    // a caller looping over many points (MultiPair) expands it ONCE and reuses
+    // it for every point; FinalExp is the convenience that expands then runs.
+    static Fp6m FinalExpBits(const Fp6m& f, const std::vector<uint8_t>& hardBits){
+        return PowBigBits(EasyPart(f), hardBits);
+    }
     static Fp6m FinalExp(const Fp6m& f, const BigInteger& hardExp){
-        return PowBig(EasyPart(f), hardExp);
+        std::vector<uint8_t> hb;
+        ExpandBits(hardExp, hb);
+        return PowBigBits(EasyPart(f), hb);
     }
 
     static Fp6 ToFp6(const Fp6m& a) {

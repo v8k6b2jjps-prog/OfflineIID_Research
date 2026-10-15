@@ -190,7 +190,7 @@ private:
         BigInteger xT = Gf::Mod(B);
         int keyByte = (int)((B / Gf::GetP()) & BigInteger(0xFF));
 
-        std::optional<std::vector<BigInteger>> T_opt = Curve::LiftX(xT, k.CurveA, k.CurveB);
+        std::optional<std::vector<BigInteger>> T_opt = FpmSqrt::LiftX(xT, k.CurveA, k.CurveB);
         if (!T_opt.has_value()) return false;
         std::vector<BigInteger> T = T_opt.value();
 
@@ -203,7 +203,7 @@ private:
         h1[3] = (unsigned char)((keyByte / b1) % b2);
 
         // 1/(-2) is a base-field scalar: one Fp inversion, not an Fp3 power.
-        Fp3 inv2(Gf::Inv(BigInteger(-2)), 0, 0);
+        Fp3 inv2(Gf::InvNeg2(), 0, 0);
         Fp3 inv2sq = inv2 * inv2;
         int np = (int)k.Points.size();
 

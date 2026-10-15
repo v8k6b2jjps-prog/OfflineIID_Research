@@ -95,8 +95,8 @@ public:
             }
 
             // ---- Addition of T based on current bit of n ----
-            BigInteger bitCheck = (n >> i) & BigInteger::One();
-            if (!bitCheck.IsZero()) {
+            // Allocation-free bit test (was: (n >> i) & One(), two mpz_t/bit).
+            if (n.TestBit(i)) {
                 if (vInf) {
                     vxm = txm; vym = tym; vInf = false;
                 }
@@ -237,8 +237,8 @@ public:
             }
 
             // ---- addition of T based on current bit of n: also shared ----
-            BigInteger bitCheck = (n >> i) & BigInteger::One();
-            if (!bitCheck.IsZero()) {
+            // Allocation-free bit test (was: (n >> i) & One(), two mpz_t/bit).
+            if (n.TestBit(i)) {
                 Fpx addVxOld{}, addVyOld{}, addLam{};
                 bool haveAddLine = false;
                 bool becameInf = false, tookT = false;
@@ -307,7 +307,12 @@ public:
         std::vector<Fp6> out(m);
         if (((p3 + 1) % n).IsZero()) {
             BigInteger hard = (p3 + 1) / n;
-            for (int j = 0; j < m; j++) out[j] = Fp6mOp::ToFp6(Fp6mOp::FinalExp(f[j], hard));
+            // Expand the hard exponent ONCE, reuse for every point. hard depends
+            // on the curve order n (varies per bink), so it is NOT globally
+            // cached -- but within this call all m points share it.
+            std::vector<uint8_t> hardBits;
+            Fp6mOp::ExpandBits(hard, hardBits);
+            for (int j = 0; j < m; j++) out[j] = Fp6mOp::ToFp6(Fp6mOp::FinalExpBits(f[j], hardBits));
         }
         else {
             BigInteger p6 = IntegerPow(p, 6);
