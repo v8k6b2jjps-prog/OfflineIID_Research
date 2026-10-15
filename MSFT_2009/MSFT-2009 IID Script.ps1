@@ -77,7 +77,7 @@ typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
     void*    pGroupIndex;              // 0x88 -> master index of all GroupIDs
     uint64_t ReservedNonce;            // 0x90  8 random bytes from CryptGenRandom (per-object nonce/salt);
                                        //       set in sub_180015728 via CryptGenRandom(hProv,8,&ReservedNonce).
-                                       //       NOT a pointer, NOT key-derived â€” differs every construction.
+                                       //       NOT a pointer, NOT key-derived” differs every construction.
 } PID_OBJ;                             // 0x98
 #>
 
