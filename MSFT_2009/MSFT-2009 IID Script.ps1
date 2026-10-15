@@ -22,7 +22,7 @@ BYTE11(v53) = (*(_DWORD *)(a1 + 28) != 0 ? 8 : 0) | ...
 -- Activation Data --
 
 sub_1800090B0 (Base Math Parser / decoder)   -- the real driver in the act path
-└─ sub_180008A58  (THE BIT PACKER)
+    sub_180008A58  (THE BIT PACKER)
 	upgrade(bit0) | serial<<1 (30b) | group<<31 (20b) | security<<51 (53b)
 	-> writes the 13 act bytes at buffer +0x48  (= your BigInteger formula, exactly)
 
@@ -75,7 +75,9 @@ typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
     void*    pGroupConfig;             // 0x78 -> pkeyconfig group records {flag, ActConfigId GUID, GroupID, sub-ptrs}
     void*    pEditionTable;            // 0x80 -> edition records {ActConfigId, EditionId GUID, GroupID, KeyRange=9999999}
     void*    pGroupIndex;              // 0x88 -> master index of all GroupIDs
-    uint64_t Field90;                  // 0x90 -> data qword (NOT a pointer; seed/cookie/hash still to characterize)
+    uint64_t ReservedNonce;            // 0x90  8 random bytes from CryptGenRandom (per-object nonce/salt);
+                                       //       set in sub_180015728 via CryptGenRandom(hProv,8,&ReservedNonce).
+                                       //       NOT a pointer, NOT key-derived — differs every construction.
 } PID_OBJ;                             // 0x98
 #>
 

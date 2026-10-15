@@ -90,7 +90,9 @@ typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
     void*    pGroupConfig;             // 0x78 -> group record {flag, ActConfigId GUID (a0cde89c…), GroupID 172, sub-ptrs}
     void*    pEditionTable;            // 0x80 -> interned pkeyconfig XML (<pkc:PartNumber>X15-…, IsValid, edition GUIDs)
     void*    pGroupIndex;              // 0x88 -> key/edition descriptor {GroupID 172, KeySize=1579 (BINK blob), edition IDs}
-    uint64_t Field90;                  // 0x90 -> data qword (NOT a pointer; seed/cookie/hash” still to characterize)
+    uint64_t ReservedNonce;            // 0x90  8 random bytes from CryptGenRandom (per-object nonce/salt);
+                                       //       set in sub_180015728 via CryptGenRandom(hProv,8,&ReservedNonce).
+                                       //       NOT a pointer, NOT key-derived — differs every construction.
 } PID_OBJ;                             // 0x98
 #>
 
