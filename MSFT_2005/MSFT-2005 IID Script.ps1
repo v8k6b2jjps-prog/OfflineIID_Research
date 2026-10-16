@@ -68,7 +68,7 @@ typedef struct _MSFT_PKEY_DATA {       // 0x58
                                        //        stays 0 on an invalid key)
     uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
     union {                            // 0x48  16-byte slot; base64'd by sub_180015728
-        uint8_t Decoded_M[6];          //   2005: 6 real M bytes;  base64 emits 12 (6 + zero-pad)
+        uint8_t* pDecodedM;            //   2005: Pointer to M / config row (8 bytes)
         uint8_t ActData[13];           //   2009: 13 packed bytes; base64 emits 13
         uint8_t Payload[16];           //   full slot; unused tail = 0
     };
