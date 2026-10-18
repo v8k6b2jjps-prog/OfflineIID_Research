@@ -1,4 +1,4 @@
-using namespace System
+﻿using namespace System
 using namespace System.IO
 using namespace System.Text
 using namespace System.Numerics
@@ -49,13 +49,13 @@ typedef struct _MSFT_PKEY_DATA {       // 0x58
     uint64_t Security;                 // 0x28
     uint32_t HaveRawKey;               // 0x30  1 once RawKeyMaterial@0x38 is populated (set early, both algos)
     uint32_t Solved;                   // 0x34  0 until validation succeeds; 1 on success
-                                       //       (2005: 0 through pipeline → 1 after MITM; 2009: 1 at parse;
+                                       //       (2005: 0 through pipeline ג†’ 1 after MITM; 2009: 1 at parse;
                                        //        stays 0 on an invalid key)
     uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
-    union {                            // 0x48  16-byte slot; base64'd by sub_180015728
-        uint8_t* pDecodedM;            //   2005: Pointer to M / config row (8 bytes)
-        uint8_t ActData[13];           //   2009: 13 packed bytes; base64 emits 13
-        uint8_t Payload[16];           //   full slot; unused tail = 0
+    union {                            // 0x48  16-byte slot
+        uint8_t  DecodedM[12];         //   2005: M value (6 bytes) + 6 zero padding → base64 12
+        uint8_t  ActData[13];          //   2009: 13 packed bytes
+        uint8_t  Payload[16];          //   full slot; unused tail = 0
     };
 } MSFT_PKEY_DATA;                      // ends 0x58
 
@@ -72,12 +72,22 @@ typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
 
     MSFT_PKEY_DATA Data;               // 0x20 .. 0x78
 
-    void*    pGroupConfig;             // 0x78 -> pkeyconfig group records {flag, ActConfigId GUID, GroupID, sub-ptrs}
-    void*    pEditionTable;            // 0x80 -> edition records {ActConfigId, EditionId GUID, GroupID, KeyRange=9999999}
-    void*    pGroupIndex;              // 0x88 -> master index of all GroupIDs
+    void*    pGroupConfig;             // 0x78 -> group record {flag, ActConfigId GUID, GroupID, sub-ptrs}
+                                       //   2005: {flag, ActConfigId GUID (a0cde89c…), GroupID 172, sub-ptrs}
+                                       //   2009: {flag, ActConfigId GUID, GroupID, sub-ptrs}
+
+    void*    pEditionTable;            // 0x80 -> edition records
+                                       //   2005: interned pkeyconfig XML (<pkc:PartNumber>X15-…, IsValid, edition GUIDs)
+                                       //   2009: {ActConfigId, EditionId GUID, GroupID, KeyRange=9999999}
+
+    void*    pGroupIndex;              // 0x88 -> master index
+                                       //   2005: key/edition descriptor {GroupID 172, KeySize=1579 (BINK blob), edition IDs}
+                                       //   2009: master index of all GroupIDs
+
     uint64_t ReservedNonce;            // 0x90  8 random bytes from CryptGenRandom (per-object nonce/salt);
                                        //       set in sub_180015728 via CryptGenRandom(hProv,8,&ReservedNonce).
-                                       //       NOT a pointer, NOT key-derived� differs every construction.
+                                       //       NOT a pointer, NOT key-derived — differs every construction.
+
 } PID_OBJ;                             // 0x98
 #>
 

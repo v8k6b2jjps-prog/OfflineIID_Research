@@ -1,4 +1,4 @@
-using namespace System
+﻿using namespace System
 using namespace System.IO
 using namespace System.Text
 using namespace System.Numerics
@@ -47,7 +47,7 @@ PublicKeyValue --> ECC Information, --> match against Raw Key Info
 -- Most Updated Struct Info --
 
 // ============================================================================
-//  MSFT_PKEY_DATA� 0x58 bytes. Shared by 2005 and 2009.
+//  MSFT_PKEY_DATA” 0x58 bytes. Shared by 2005 and 2009.
 //  Begins at PID_OBJ+0x20; decoder writes it in place via &obj->Data.
 // ============================================================================
 
@@ -64,18 +64,18 @@ typedef struct _MSFT_PKEY_DATA {       // 0x58
     uint64_t Security;                 // 0x28
     uint32_t HaveRawKey;               // 0x30  1 once RawKeyMaterial@0x38 is populated (set early, both algos)
     uint32_t Solved;                   // 0x34  0 until validation succeeds; 1 on success
-                                       //       (2005: 0 through pipeline → 1 after MITM; 2009: 1 at parse;
+                                       //       (2005: 0 through pipeline ג†’ 1 after MITM; 2009: 1 at parse;
                                        //        stays 0 on an invalid key)
     uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
-    union {                            // 0x48  16-byte slot; base64'd by sub_180015728
-        uint8_t* pDecodedM;            //   2005: Pointer to M / config row (8 bytes)
-        uint8_t ActData[13];           //   2009: 13 packed bytes; base64 emits 13
-        uint8_t Payload[16];           //   full slot; unused tail = 0
+    union {                            // 0x48  16-byte slot
+        uint8_t  DecodedM[12];         //   2005: M value (6 bytes) + 6 zero padding → base64 12
+        uint8_t  ActData[13];          //   2009: 13 packed bytes
+        uint8_t  Payload[16];          //   full slot; unused tail = 0
     };
 } MSFT_PKEY_DATA;                      // ends 0x58
 
 // ============================================================================
-//  PID_OBJ� 0x98 bytes. Embeds MSFT_PKEY_DATA at +0x20.
+//  PID_OBJ” 0x98 bytes. Embeds MSFT_PKEY_DATA at +0x20.
 // ============================================================================
 
 typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
@@ -87,12 +87,22 @@ typedef struct _PID_OBJ {              // HeapAlloc size = 0x98
 
     MSFT_PKEY_DATA Data;               // 0x20 .. 0x78
 
-    void*    pGroupConfig;             // 0x78 -> group record {flag, ActConfigId GUID (a0cde89c�), GroupID 172, sub-ptrs}
-    void*    pEditionTable;            // 0x80 -> interned pkeyconfig XML (<pkc:PartNumber>X15-�, IsValid, edition GUIDs)
-    void*    pGroupIndex;              // 0x88 -> key/edition descriptor {GroupID 172, KeySize=1579 (BINK blob), edition IDs}
+    void*    pGroupConfig;             // 0x78 -> group record {flag, ActConfigId GUID, GroupID, sub-ptrs}
+                                       //   2005: {flag, ActConfigId GUID (a0cde89c…), GroupID 172, sub-ptrs}
+                                       //   2009: {flag, ActConfigId GUID, GroupID, sub-ptrs}
+
+    void*    pEditionTable;            // 0x80 -> edition records
+                                       //   2005: interned pkeyconfig XML (<pkc:PartNumber>X15-…, IsValid, edition GUIDs)
+                                       //   2009: {ActConfigId, EditionId GUID, GroupID, KeyRange=9999999}
+
+    void*    pGroupIndex;              // 0x88 -> master index
+                                       //   2005: key/edition descriptor {GroupID 172, KeySize=1579 (BINK blob), edition IDs}
+                                       //   2009: master index of all GroupIDs
+
     uint64_t ReservedNonce;            // 0x90  8 random bytes from CryptGenRandom (per-object nonce/salt);
                                        //       set in sub_180015728 via CryptGenRandom(hProv,8,&ReservedNonce).
-                                       //       NOT a pointer, NOT key-derived � differs every construction.
+                                       //       NOT a pointer, NOT key-derived — differs every construction.
+
 } PID_OBJ;                             // 0x98
 #>
 
@@ -445,27 +455,15 @@ Write-Host
 Write-Host "Re-manufacturing the 12-Byte Material Block..." -ForegroundColor Cyan
 
 # Decoded M -> SOurce sub_180090ADC
-$ConfigRowPtr = [Marshal]::ReadIntPtr($HeapPtr, 104)
+$ConfigRowPtr = [IntPtr]::Add($HeapPtr, 104)
+Format-HexView -Address $ConfigRowPtr -Size 12 -Mode 4x
+$managedBytes = New-Object Byte[] 12
+[Marshal]::Copy($ConfigRowPtr, $managedBytes, 0, 12)
+$base64String = [Convert]::ToBase64String($managedBytes)
 
-if ($ConfigRowPtr -ne [IntPtr]::Zero) {
-
-    $RawMaterialBuffer = New-IntPtr -Size 12
-    [Marshal]::WriteInt64($RawMaterialBuffer, 0, $ConfigRowPtr.ToInt64())
-    [Marshal]::WriteInt32($RawMaterialBuffer, 8, 0)
-    Write-Host "`n--- Raw Material Structure (Before Base64) ---" -ForegroundColor Green
-    Format-HexView -Address $RawMaterialBuffer -Size 12 -Mode 4x
-
-    $managedBytes = New-Object Byte[] 12
-    [Marshal]::Copy($RawMaterialBuffer, $managedBytes, 0, 12)
-    $base64String = [Convert]::ToBase64String($managedBytes)
-
-    Write-Host
-    Write-Host "--- Base64 Encoded Result ---" -ForegroundColor Cyan
-    Write-Host $base64String
-
-} else {
-    Write-Warning "Could not extract a valid Config Row Pointer from offset 104."
-}
+Write-Host
+Write-Host "--- Base64 Encoded Result ---" -ForegroundColor Cyan
+Write-Host $base64String
 
 # MSFT2005 Pkey Generator
 # https://github.com/ntriver-org/PKeyMaster/commit/4926123bc7e56882dc13123942c3459728fb562c
