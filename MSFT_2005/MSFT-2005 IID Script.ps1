@@ -47,14 +47,17 @@ PublicKeyValue --> ECC Information, --> match against Raw Key Info
 -- Most Updated Struct Info --
 
 // ============================================================================
-//  MSFT_PKEY_DATA” 0x58 bytes. Shared by 2005 and 2009.
+//  MSFT_PKEY_DATA 0x58 bytes. Shared by 2005 and 2009.
 //  Begins at PID_OBJ+0x20; decoder writes it in place via &obj->Data.
 // ============================================================================
 
 typedef struct _MSFT_PKEY_DATA {       // 0x58
     uint64_t Reserved;                 // 0x00  = 0
-    GUID     Algorithm;                // 0x08  2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
-                                       //       2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+    GUID     Algorithm;                // 0x08  2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+                                       //       2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
+                                       //        986:{2B864AA3-A736-4D50-8604-EBB3BD7D7C61}
+                                       //        985:{9F44BF99-4976-4BFD-B00A-A8AEFBA45484}
+                                       //        980:{35BFEDB3-9131-4F58-9D9A-5B32D10F50E0}
                                        //   constant per algorithm (GetClsidAlgorithm);
                                        //   NOT key-specific, NOT the ProductId ActConfigId GUID
     uint32_t GroupID;                  // 0x18
@@ -67,10 +70,11 @@ typedef struct _MSFT_PKEY_DATA {       // 0x58
                                        //       (2005: 0 through pipeline ג†’ 1 after MITM; 2009: 1 at parse;
                                        //        stays 0 on an invalid key)
     uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
-    union {                            // 0x48  16-byte slot
-        uint8_t  DecodedM[12];         //   2005: M value (6 bytes) + 6 zero padding → base64 12
-        uint8_t  ActData[13];          //   2009: 13 packed bytes
-        uint8_t  Payload[16];          //   full slot; unused tail = 0
+    union {                            // 0x48  16-byte slot (consumed by sub_180015728 for output)
+        uint8_t  Legacy[4];            //  9XX : upgrade | serial<<1                       [In] 31  bits, [Out] 12 bytes, sub_18008D4E0
+        uint8_t  DecodedM[6];          //  2005: upgrade | serial<<1 | (sec & 0x3FF)<<31   [In] 41  bits, [Out] 12 bytes, sub_18008DA70 = sub_18008D4E0 + sec merge; M via sub_180090ADC
+        uint8_t  ActData[13];          //  2009: upgrade | serial<<1 | group<<31 | sec<<51 [In] 104 bits, [Out] 13 bytes, sub_18008DE60 -> sub_180008A58
+                                       //  widths: upgrade=1  serial=30  group=20  sec: 9XX=0, 2005=10, 2009=53
     };
 } MSFT_PKEY_DATA;                      // ends 0x58
 

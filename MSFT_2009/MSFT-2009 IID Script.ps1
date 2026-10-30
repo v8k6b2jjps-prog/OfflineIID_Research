@@ -38,8 +38,11 @@ sub_18008DE60 (vtable slot 4) is the OTHER caller of the same packer
 
 typedef struct _MSFT_PKEY_DATA {       // 0x58
     uint64_t Reserved;                 // 0x00  = 0
-    GUID     Algorithm;                // 0x08  2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
-                                       //       2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+    GUID     Algorithm;                // 0x08  2009:{660672EF-7809-4CFD-8D54-41B7FB738988}
+                                       //       2005:{B8731595-A2F6-430B-A799-FBFFB81A8D73}
+                                       //        986:{2B864AA3-A736-4D50-8604-EBB3BD7D7C61}
+                                       //        985:{9F44BF99-4976-4BFD-B00A-A8AEFBA45484}
+                                       //        980:{35BFEDB3-9131-4F58-9D9A-5B32D10F50E0}
                                        //   constant per algorithm (GetClsidAlgorithm);
                                        //   NOT key-specific, NOT the ProductId ActConfigId GUID
     uint32_t GroupID;                  // 0x18
@@ -52,10 +55,11 @@ typedef struct _MSFT_PKEY_DATA {       // 0x58
                                        //       (2005: 0 through pipeline ג†’ 1 after MITM; 2009: 1 at parse;
                                        //        stays 0 on an invalid key)
     uint8_t  RawKeyMaterial[16];       // 0x38  base-24 decoded, group-first
-    union {                            // 0x48  16-byte slot
-        uint8_t  DecodedM[12];         //   2005: M value (6 bytes) + 6 zero padding → base64 12
-        uint8_t  ActData[13];          //   2009: 13 packed bytes
-        uint8_t  Payload[16];          //   full slot; unused tail = 0
+    union {                            // 0x48  16-byte slot (consumed by sub_180015728 for output)
+        uint8_t  Legacy[4];            //  9XX : upgrade | serial<<1                       [In] 31  bits, [Out] 12 bytes, sub_18008D4E0
+        uint8_t  DecodedM[6];          //  2005: upgrade | serial<<1 | (sec & 0x3FF)<<31   [In] 41  bits, [Out] 12 bytes, sub_18008DA70 = sub_18008D4E0 + sec merge; M via sub_180090ADC
+        uint8_t  ActData[13];          //  2009: upgrade | serial<<1 | group<<31 | sec<<51 [In] 104 bits, [Out] 13 bytes, sub_18008DE60 -> sub_180008A58
+                                       //  widths: upgrade=1  serial=30  group=20  sec: 9XX=0, 2005=10, 2009=53
     };
 } MSFT_PKEY_DATA;                      // ends 0x58
 
@@ -1732,7 +1736,7 @@ Write-Host
 
 Set-Location $PSScriptRoot
 
-$CdKey   = 'WNJ83-QJ3QD-FGT7X-KM99T-P7JWP'
+$CdKey   = 'QPM6N-7J2WJ-P88HH-P3YRH-YY74H'
 $DllPath = Join-Path $PSScriptRoot "pidgenxIn.dll"
 $CfgPath = 'C:\Windows\System32\spp\tokens\pkeyconfig\pkeyconfig.xrm-ms'
 $hModule = Ldr-LoadDll -dwFlags ALTERED_SEARCH -dll $DllPath
@@ -1856,20 +1860,16 @@ Write-Host
 $piddll = Join-Path $PSScriptRoot "pidgenxIn.dll"
 
 # a1 layout the packer reads: group@0, serial@4, flags@8 (bit0=upgrade), security@0x10
+$OutData   = [Byte[]]::new(13)
 $InputData = [Byte[]]::new(24)
 [BitConverter]::GetBytes([Int32]$Group   ).CopyTo($InputData, 0)   # +0x00
 [BitConverter]::GetBytes([Int32]$serial  ).CopyTo($InputData, 4)   # +0x04  (full serial)
-[BitConverter]::GetBytes([Int32]$upgrade ).CopyTo($InputData, 8)   # +0x08  <-- was missing
+[BitConverter]::GetBytes([Int32]$upgrade ).CopyTo($InputData, 8)   # +0x08
 [BitConverter]::GetBytes([Int64]$security).CopyTo($InputData,16)   # +0x10
 
-$InPtr  = New-IntPtr -Data $InputData
-$OutPtr = New-IntPtr -Size 13
 try {
-    $hr = Invoke-UnmanagedMethod -Dll $piddll -Function "Inner" -Sub 0x180008A58 -Values @($InPtr, $OutPtr)
+    $hr = Invoke-UnmanagedMethod -Dll $piddll -Function "Inner" -Sub 0x180008A58 -Values @($InputData, $OutData)
     if ($hr -ne 0) { throw "packer returned 0x{0:X}" -f $hr }
-
-    $OutData = [Byte[]]::new(13)
-    [Marshal]::Copy($OutPtr, $OutData, 0, 13)
 }
 finally {
     Free-IntPtr $InPtr
